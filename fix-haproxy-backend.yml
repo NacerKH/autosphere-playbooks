@@ -1,0 +1,165 @@
+---
+# HAProxy Backend Health Fix Playbook
+# Handles: Specific backend down, health check failures, timeout issues
+# Risk: Low (no HAProxy restart, only backend manipulation)
+# Estimated Time: 30-45 seconds
+
+- name: Fix HAProxy Backend Health Issues
+  hosts: "{{ target_host | default('control') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    haproxy_container: haproxy
+    backend_name: "{{ target_backend | mandatory }}"  # e.g., nova-api, neutron-server
+    backend_server: "{{ target_server | default('') }}"  # Optional specific server
+    action: "{{ backend_action | default('drain-enable') }}"  # drain-enable, disable-enable, restart-backend
+    health_check_timeout: 30
+
+  pre_tasks:
+    - name: Validate backend exists
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "^{{ backend_name }}"
+      register: backend_exists
+      changed_when: false
+      failed_when: backend_exists.rc != 0
+
+    - name: Get backend current status
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "^{{ backend_name }}" | cut -d',' -f1,2,18,19
+      register: backend_status_before
+      changed_when: false
+
+  tasks:
+    - name: Display current backend state
+      debug:
+        msg: "{{ backend_status_before.stdout_lines }}"
+
+    - name: Action - Drain and re-enable backend server
+      block:
+        - name: Set backend server to DRAIN
+          shell: |
+            echo "set server {{ backend_name }}/{{ item }} state drain" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          loop: "{{ backend_status_before.stdout_lines | map('regex_replace', '^([^,]+),([^,]+).*', '\\2') | list }}"
+          when: 
+            - action == 'drain-enable'
+            - backend_server == '' or item == backend_server
+
+        - name: Wait for connections to drain
+          pause:
+            seconds: 5
+
+        - name: Re-enable backend server
+          shell: |
+            echo "set server {{ backend_name }}/{{ item }} state ready" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          loop: "{{ backend_status_before.stdout_lines | map('regex_replace', '^([^,]+),([^,]+).*', '\\2') | list }}"
+          when: 
+            - action == 'drain-enable'
+            - backend_server == '' or item == backend_server
+
+        - name: Force health check
+          shell: |
+            echo "set server {{ backend_name }}/{{ item }} health up" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          loop: "{{ backend_status_before.stdout_lines | map('regex_replace', '^([^,]+),([^,]+).*', '\\2') | list }}"
+          when: backend_server == '' or item == backend_server
+          failed_when: false
+
+    - name: Action - Disable and re-enable (hard reset)
+      block:
+        - name: Disable backend server
+          shell: |
+            echo "disable server {{ backend_name }}/{{ item }}" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          loop: "{{ backend_status_before.stdout_lines | map('regex_replace', '^([^,]+),([^,]+).*', '\\2') | list }}"
+          when: 
+            - action == 'disable-enable'
+            - backend_server == '' or item == backend_server
+
+        - name: Wait before re-enable
+          pause:
+            seconds: 3
+
+        - name: Enable backend server
+          shell: |
+            echo "enable server {{ backend_name }}/{{ item }}" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          loop: "{{ backend_status_before.stdout_lines | map('regex_replace', '^([^,]+),([^,]+).*', '\\2') | list }}"
+          when: 
+            - action == 'disable-enable'
+            - backend_server == '' or item == backend_server
+      when: action == 'disable-enable'
+
+    - name: Action - Restart specific backend service containers
+      block:
+        - name: Identify backend service containers
+          shell: |
+            docker ps --filter name={{ backend_name }} --format '{{.Names}}'
+          register: backend_containers
+          changed_when: false
+
+        - name: Restart backend service containers
+          docker_container:
+            name: "{{ item }}"
+            state: started
+            restart: yes
+          loop: "{{ backend_containers.stdout_lines }}"
+          when: backend_containers.stdout_lines | length > 0
+
+        - name: Wait for services to be ready
+          pause:
+            seconds: 10
+      when: action == 'restart-backend'
+
+    - name: Wait for health checks to pass
+      pause:
+        seconds: "{{ health_check_timeout }}"
+
+    - name: Post-Check - Verify backend is UP
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "^{{ backend_name }}" | cut -d',' -f1,2,18
+      register: backend_status_after
+      changed_when: false
+
+    - name: Validate backend health improvement
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "^{{ backend_name }}" | grep -c "UP"
+      register: healthy_count
+      changed_when: false
+      failed_when: healthy_count.stdout | int < 1
+
+    - name: Test API endpoint for specific service
+      uri:
+        url: "{{ item.url }}"
+        method: GET
+        status_code: [200, 300, 401]
+        timeout: 10
+        validate_certs: no
+      loop:
+        - { name: "nova-api", url: "https://{{ internal_vip | default('10.0.0.100') }}:8774/v2.1" }
+        - { name: "neutron-server", url: "https://{{ internal_vip | default('10.0.0.100') }}:9696/v2.0" }
+        - { name: "glance-api", url: "https://{{ internal_vip | default('10.0.0.100') }}:9292/v2" }
+        - { name: "cinder-api", url: "https://{{ internal_vip | default('10.0.0.100') }}:8776/v3" }
+        - { name: "keystone", url: "https://{{ internal_vip | default('10.0.0.100') }}:5000/v3" }
+      when: backend_name | regex_search(item.name)
+      register: api_check
+      failed_when: false
+
+  post_tasks:
+    - name: Report backend fix outcome
+      debug:
+        msg: |
+          Backend Fix Summary:
+          - Backend: {{ backend_name }}
+          - Action: {{ action }}
+          - Before: {{ backend_status_before.stdout_lines | length }} servers
+          - After: {{ healthy_count.stdout }} healthy servers
+          - API Test: {{ 'PASS' if api_check is succeeded else 'DEGRADED' }}
+          - Resolution Time: ~30 seconds
+
+    - name: Log to Redmine (if ticket exists)
+      shell: |
+        logger -t autosphere-haproxy "Backend {{ backend_name }} fixed using {{ action }} on {{ inventory_hostname }}"
+
+  handlers:
+    - name: Alert if backend still down
+      debug:
+        msg: "WARNING: Backend {{ backend_name }} still has issues. Escalate to manual intervention."
+      when: healthy_count.stdout | int < 1

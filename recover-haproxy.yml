@@ -1,0 +1,150 @@
+---
+# AutoSphere Playbook: HAProxy Load Balancer Recovery
+# Purpose: Restore HAProxy for OpenStack API access
+# Risk: HIGH - All API endpoints unavailable during restart
+# Estimated Time: 5 minutes
+# Last Updated: 2025
+
+- name: HAProxy Load Balancer Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    haproxy_container: "{{ haproxy_container_name | default('haproxy') }}"
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify HAProxy container"
+      shell: docker ps -a --filter "name={{ haproxy_container }}" --format "{%raw%}{{.Names}}{%endraw%}"
+      register: container_check
+      failed_when: container_check.stdout == ""
+      
+    - name: "[PRE-CHECK] Check HAProxy stats"
+      shell: |
+        docker exec {{ haproxy_container }} echo "show stat" | \
+          socat /var/lib/haproxy/stats stdio || true
+      register: haproxy_stats
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Check backend server status"
+      shell: |
+        docker exec {{ haproxy_container }} echo "show servers state" | \
+          socat /var/lib/haproxy/stats stdio || true
+      register: backend_status
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Review HAProxy logs"
+      shell: docker logs --tail 100 {{ haproxy_container }} 2>&1
+      register: haproxy_logs
+      
+    - name: "[BACKUP] Save HAProxy configuration"
+      shell: |
+        docker exec {{ haproxy_container }} cat /etc/haproxy/haproxy.cfg \
+          > /tmp/haproxy_{{ incident_id }}.cfg
+          
+    - name: "[EXECUTE] Restart HAProxy"
+      shell: docker restart {{ haproxy_container }}
+      
+    - name: "[VERIFY] Wait for HAProxy ready"
+      wait_for:
+        timeout: 30
+        
+    - name: "[VERIFY] Check HAProxy process"
+      shell: docker exec {{ haproxy_container }} pidof haproxy
+      register: haproxy_process
+      retries: 5
+      delay: 5
+      until: haproxy_process.rc == 0
+      
+    - name: "[VERIFY] Test backend connectivity"
+      shell: |
+        docker exec {{ haproxy_container }} echo "show servers state" | \
+          socat /var/lib/haproxy/stats stdio
+      register: backends_after
+      retries: 5
+      delay: 5
+      until: backends_after.rc == 0
+      
+    - name: "[POST-CHECK] Test API endpoints"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        
+        # Test each API endpoint
+        for service in keystone nova neutron cinder glance; do
+          endpoint=$(openstack catalog show $service -f json 2>/dev/null | jq -r '.endpoints[] | select(.interface == "public") | .url' | head -1)
+          if [ -n "$endpoint" ]; then
+            if curl -k -s -o /dev/null -w "%{http_code}" "$endpoint" | grep -q "^[23]"; then
+              echo "✅ $service API: OK"
+            else
+              echo "❌ $service API: FAILED"
+            fi
+          fi
+        done
+      register: api_tests
+      ignore_errors: yes
+      
+    - name: "[POST-CHECK] Verify all backends up"
+      shell: |
+        docker exec {{ haproxy_container }} echo "show stat" | \
+          socat /var/lib/haproxy/stats stdio | \
+          grep -c ",UP," || echo "0"
+      register: up_backends
+      
+    - name: "[REPORT] Generate recovery report"
+      copy:
+        content: |
+          ========================================
+          HAPROXY LOAD BALANCER RECOVERY
+          ========================================
+          
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          
+          BACKENDS BEFORE:
+          {{ backend_status.stdout }}
+          
+          HAPROXY LOGS:
+          {{ haproxy_logs.stdout }}
+          
+          BACKENDS AFTER:
+          {{ backends_after.stdout }}
+          
+          UP BACKENDS: {{ up_backends.stdout }}
+          
+          API ENDPOINT TESTS:
+          {{ api_tests.stdout }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_haproxy.log"
+        
+    - name: "[ALERT] Recovery complete"
+      debug:
+        msg: |
+          ✅ HAProxy recovered
+          
+          Incident: {{ incident_id }}
+          Backends UP: {{ up_backends.stdout }}
+          Status: {{ 'HEALTHY' if haproxy_process.rc == 0 else 'DEGRADED' }}
+          
+          Report: /tmp/autosphere_incident_{{ incident_id }}_haproxy.log
+          
+  rescue:
+    - name: "[ROLLBACK] Restore configuration"
+      shell: |
+        docker cp /tmp/haproxy_{{ incident_id }}.cfg {{ haproxy_container }}:/etc/haproxy/haproxy.cfg
+        docker restart {{ haproxy_container }}
+      ignore_errors: yes
+      
+    - name: "[ALERT] Recovery failed"
+      debug:
+        msg: |
+          ❌ HAPROXY RECOVERY FAILED
+          
+          Check: /tmp/autosphere_incident_{{ incident_id }}_haproxy.log
+          Manual steps:
+          1. Verify haproxy.cfg syntax
+          2. Check backend server connectivity
+          3. Review: docker logs haproxy
+          
+    - fail:
+        msg: "HAProxy recovery failed"

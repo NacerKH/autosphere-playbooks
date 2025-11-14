@@ -1,0 +1,125 @@
+---
+# AutoSphere Playbook: Memcached Cache Recovery
+# Purpose: Fix Memcached connection issues and cache performance
+# Risk: LOW - Brief cache miss spike
+# Estimated Time: 3 minutes
+# Last Updated: 2025
+
+- name: Memcached Cache Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    memcached_container: "memcached"
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify Memcached container"
+      shell: docker ps --filter "name={{ memcached_container }}" --format "{%raw%}{{.Names}}{%endraw%}"
+      register: container_check
+      failed_when: container_check.stdout == ""
+      
+    - name: "[DIAGNOSIS] Check Memcached stats"
+      shell: |
+        echo "stats" | nc localhost 11211 | head -20
+      register: memcached_stats
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Check hit/miss ratio"
+      shell: |
+        echo "stats" | nc localhost 11211 | grep -E "get_hits|get_misses|curr_items|evictions"
+      register: cache_performance
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Test cache connectivity"
+      shell: |
+        # Simple set/get test
+        (echo -e "set test_key 0 60 5\r\nhello\r\nquit\r\n"; sleep 1) | nc localhost 11211
+        (echo -e "get test_key\r\nquit\r\n"; sleep 1) | nc localhost 11211
+      register: connectivity_test
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Save Memcached state"
+      shell: |
+        echo "stats" | nc localhost 11211 > /tmp/memcached_stats_{{ incident_id }}.txt
+        docker logs --tail 100 {{ memcached_container }} > /tmp/memcached_{{ incident_id }}.log 2>&1
+        
+    - name: "[EXECUTE] Restart Memcached"
+      shell: docker restart {{ memcached_container }}
+      
+    - name: "[VERIFY] Wait for Memcached ready"
+      wait_for:
+        port: 11211
+        timeout: 30
+        
+    - name: "[VERIFY] Test connectivity after restart"
+      shell: |
+        echo "stats" | nc localhost 11211 | grep -q "STAT version"
+      register: connectivity_check
+      retries: 10
+      delay: 3
+      until: connectivity_check.rc == 0
+      
+    - name: "[VERIFY] Test cache operations"
+      shell: |
+        # Set test
+        (echo -e "set autosphere_test 0 60 10\r\ntest_value\r\nquit\r\n"; sleep 1) | nc localhost 11211 | grep -q "STORED"
+        # Get test
+        (echo -e "get autosphere_test\r\nquit\r\n"; sleep 1) | nc localhost 11211 | grep -q "test_value"
+      register: operation_test
+      
+    - name: "[POST-CHECK] Monitor cache performance"
+      shell: |
+        sleep 30
+        echo "stats" | nc localhost 11211 | grep -E "get_hits|get_misses|curr_items"
+      register: post_stats
+      
+    - name: "[POST-CHECK] Verify Keystone/Horizon using cache"
+      shell: |
+        # Check if services reconnected to memcached
+        docker logs --tail 50 keystone 2>&1 | grep -i "memcache" | tail -5 || echo "No memcache logs"
+        docker logs --tail 50 horizon 2>&1 | grep -i "cache\|session" | tail -5 || echo "No cache logs"
+      register: service_cache_logs
+      
+    - name: "[REPORT] Generate report"
+      copy:
+        content: |
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Action: Memcached Cache Recovery
+          
+          BEFORE:
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          {{ cache_performance.stdout | default('N/A') }}
+          
+          CONNECTIVITY TEST:
+          {{ connectivity_test.stdout }}
+          
+          AFTER:
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          {{ post_stats.stdout }}
+          
+          OPERATION TEST:
+          {{ 'PASS' if operation_test.rc == 0 else 'FAIL' }}
+          
+          SERVICE INTEGRATION:
+          {{ service_cache_logs.stdout }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_memcached.log"
+        
+    - name: "[ALERT] Success"
+      debug:
+        msg: |
+          ✅ Memcached recovered
+          Incident: {{ incident_id }}
+          Cache: OPERATIONAL
+          Services: RECONNECTED
+          
+  rescue:
+    - name: "[ROLLBACK] Force restart"
+      shell: docker restart {{ memcached_container }}
+      ignore_errors: yes
+      
+    - fail:
+        msg: "Memcached recovery failed"

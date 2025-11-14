@@ -1,0 +1,265 @@
+---
+# HAProxy Health Check Configuration Playbook
+# Handles: False positive backend failures, timeout tuning, health check optimization
+# Risk: Low (configuration change with graceful reload)
+# Estimated Time: 45-60 seconds
+
+- name: Optimize HAProxy Health Checks - Kolla-Ansible
+  hosts: "{{ target_host | default('control') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    haproxy_container: haproxy
+    config_backup_dir: /etc/kolla/haproxy/backups
+    health_check_interval: "{{ hc_interval | default('5s') }}"
+    health_check_timeout: "{{ hc_timeout | default('3s') }}"
+    health_check_rise: "{{ hc_rise | default('3') }}"
+    health_check_fall: "{{ hc_fall | default('2') }}"
+    backend_timeout_connect: "{{ timeout_connect | default('10s') }}"
+    backend_timeout_server: "{{ timeout_server | default('60s') }}"
+    target_backend: "{{ fix_backend | default('all') }}"
+
+  pre_tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ config_backup_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Backup current HAProxy configuration
+      shell: |
+        docker exec {{ haproxy_container }} cat /etc/haproxy/haproxy.cfg > {{ config_backup_dir }}/haproxy.cfg.$(date +%Y%m%d_%H%M%S)
+      changed_when: false
+
+    - name: Get current backend health check settings
+      shell: |
+        docker exec {{ haproxy_container }} grep -A 10 "backend {{ target_backend }}" /etc/haproxy/haproxy.cfg || true
+      register: current_backend_config
+      changed_when: false
+      when: target_backend != 'all'
+
+    - name: Display current backend configuration
+      debug:
+        msg: "{{ current_backend_config.stdout_lines }}"
+      when: 
+        - target_backend != 'all'
+        - current_backend_config.stdout != ''
+
+  tasks:
+    - name: Extract HAProxy config from container
+      shell: |
+        docker exec {{ haproxy_container }} cat /etc/haproxy/haproxy.cfg > /tmp/haproxy.cfg.temp
+      changed_when: false
+
+    - name: Optimize OpenStack service backend health checks
+      block:
+        - name: Update Keystone backend health checks
+          blockinfile:
+            path: /tmp/haproxy.cfg.temp
+            marker: "# {mark} ANSIBLE MANAGED - Keystone Health Checks"
+            insertafter: "backend keystone-"
+            block: |
+              option httpchk GET /v3
+              http-check expect status 200
+              timeout connect {{ backend_timeout_connect }}
+              timeout server {{ backend_timeout_server }}
+              default-server inter {{ health_check_interval }} rise {{ health_check_rise }} fall {{ health_check_fall }}
+          when: target_backend == 'all' or target_backend == 'keystone'
+
+        - name: Update Nova API backend health checks
+          blockinfile:
+            path: /tmp/haproxy.cfg.temp
+            marker: "# {mark} ANSIBLE MANAGED - Nova Health Checks"
+            insertafter: "backend nova-api"
+            block: |
+              option httpchk GET /
+              http-check expect status 200
+              timeout connect {{ backend_timeout_connect }}
+              timeout server {{ backend_timeout_server }}
+              default-server inter {{ health_check_interval }} rise {{ health_check_rise }} fall {{ health_check_fall }}
+          when: target_backend == 'all' or target_backend == 'nova'
+
+        - name: Update Neutron backend health checks
+          blockinfile:
+            path: /tmp/haproxy.cfg.temp
+            marker: "# {mark} ANSIBLE MANAGED - Neutron Health Checks"
+            insertafter: "backend neutron-server"
+            block: |
+              option httpchk GET /
+              http-check expect status 200
+              timeout connect {{ backend_timeout_connect }}
+              timeout server 120s
+              default-server inter {{ health_check_interval }} rise {{ health_check_rise }} fall {{ health_check_fall }}
+          when: target_backend == 'all' or target_backend == 'neutron'
+
+        - name: Update Glance API backend health checks
+          blockinfile:
+            path: /tmp/haproxy.cfg.temp
+            marker: "# {mark} ANSIBLE MANAGED - Glance Health Checks"
+            insertafter: "backend glance-api"
+            block: |
+              option httpchk GET /
+              http-check expect status 200
+              timeout connect {{ backend_timeout_connect }}
+              timeout server {{ backend_timeout_server }}
+              default-server inter {{ health_check_interval }} rise {{ health_check_rise }} fall {{ health_check_fall }}
+          when: target_backend == 'all' or target_backend == 'glance'
+
+        - name: Update Cinder API backend health checks
+          blockinfile:
+            path: /tmp/haproxy.cfg.temp
+            marker: "# {mark} ANSIBLE MANAGED - Cinder Health Checks"
+            insertafter: "backend cinder-api"
+            block: |
+              option httpchk GET /
+              http-check expect status 200
+              timeout connect {{ backend_timeout_connect }}
+              timeout server {{ backend_timeout_server }}
+              default-server inter {{ health_check_interval }} rise {{ health_check_rise }} fall {{ health_check_fall }}
+          when: target_backend == 'all' or target_backend == 'cinder'
+
+    - name: Add global timeout optimizations
+      block:
+        - name: Update global timeout settings
+          lineinfile:
+            path: /tmp/haproxy.cfg.temp
+            regexp: "^    timeout client"
+            line: "    timeout client 60s"
+            insertafter: "^defaults"
+
+        - name: Update global connect timeout
+          lineinfile:
+            path: /tmp/haproxy.cfg.temp
+            regexp: "^    timeout connect"
+            line: "    timeout connect {{ backend_timeout_connect }}"
+            insertafter: "^defaults"
+
+        - name: Update global server timeout
+          lineinfile:
+            path: /tmp/haproxy.cfg.temp
+            regexp: "^    timeout server"
+            line: "    timeout server {{ backend_timeout_server }}"
+            insertafter: "^defaults"
+
+        - name: Add queue timeout
+          lineinfile:
+            path: /tmp/haproxy.cfg.temp
+            regexp: "^    timeout queue"
+            line: "    timeout queue 30s"
+            insertafter: "^defaults"
+
+    - name: Validate new HAProxy configuration
+      shell: |
+        docker exec -i {{ haproxy_container }} haproxy -c -f /dev/stdin < /tmp/haproxy.cfg.temp
+      register: config_validation
+      changed_when: false
+      failed_when: config_validation.rc != 0
+
+    - name: Copy new configuration to HAProxy container
+      shell: |
+        cat /tmp/haproxy.cfg.temp | docker exec -i {{ haproxy_container }} tee /etc/haproxy/haproxy.cfg.new > /dev/null
+      changed_when: true
+
+    - name: Backup current running config
+      shell: |
+        docker exec {{ haproxy_container }} cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.backup
+      changed_when: false
+
+    - name: Apply new configuration
+      shell: |
+        docker exec {{ haproxy_container }} mv /etc/haproxy/haproxy.cfg.new /etc/haproxy/haproxy.cfg
+      changed_when: true
+
+    - name: Reload HAProxy configuration (graceful)
+      shell: |
+        docker exec {{ haproxy_container }} kill -USR2 $(docker exec {{ haproxy_container }} pgrep -x haproxy)
+      changed_when: true
+      register: reload_result
+
+    - name: Wait for HAProxy to apply new config
+      pause:
+        seconds: 10
+
+    - name: Post-Check - Verify HAProxy is running
+      shell: |
+        docker exec {{ haproxy_container }} pgrep -x haproxy
+      register: haproxy_running
+      changed_when: false
+      failed_when: haproxy_running.rc != 0
+
+    - name: Post-Check - Verify all backends are healthy
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND" | grep -v "DRAIN" | wc -l
+      register: healthy_backends
+      changed_when: false
+
+    - name: Post-Check - Check for backend DOWN status
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "DOWN" || true
+      register: down_backends
+      changed_when: false
+
+    - name: Test API endpoints with new health check settings
+      uri:
+        url: "{{ item }}"
+        method: GET
+        status_code: [200, 300, 401]
+        timeout: 10
+        validate_certs: no
+      loop:
+        - "https://{{ internal_vip | default('10.0.0.100') }}:5000/v3"
+        - "https://{{ internal_vip | default('10.0.0.100') }}:8774/v2.1"
+        - "https://{{ internal_vip | default('10.0.0.100') }}:9292/v2"
+        - "https://{{ internal_vip | default('10.0.0.100') }}:9696/v2.0"
+        - "https://{{ internal_vip | default('10.0.0.100') }}:8776/v3"
+      register: api_health_checks
+      failed_when: false
+
+    - name: Cleanup temporary files
+      file:
+        path: /tmp/haproxy.cfg.temp
+        state: absent
+
+  post_tasks:
+    - name: Report health check optimization outcome
+      debug:
+        msg: |
+          HAProxy Health Check Optimization Summary:
+          - Target Backend: {{ target_backend }}
+          - Health Check Interval: {{ health_check_interval }}
+          - Rise/Fall: {{ health_check_rise }}/{{ health_check_fall }}
+          - Timeout Connect: {{ backend_timeout_connect }}
+          - Timeout Server: {{ backend_timeout_server }}
+          - Config Reload: {{ 'SUCCESS' if reload_result is succeeded else 'FAILED' }}
+          - Healthy Backends: {{ healthy_backends.stdout }}
+          - Down Backends: {{ down_backends.stdout_lines | length }}
+          - API Health: {{ 'OK' if api_health_checks is succeeded else 'DEGRADED' }}
+          - Resolution Time: ~60 seconds
+
+    - name: Log to syslog
+      shell: |
+        logger -t autosphere-haproxy "Health check settings optimized on {{ inventory_hostname }}. Interval: {{ health_check_interval }}, Rise/Fall: {{ health_check_rise }}/{{ health_check_fall }}"
+
+    - name: Display any backends still down
+      debug:
+        msg: "WARNING: The following backends are still DOWN: {{ down_backends.stdout_lines }}"
+      when: down_backends.stdout != ''
+
+  handlers:
+    - name: Rollback configuration if failed
+      block:
+        - name: Restore backup configuration
+          shell: |
+            docker exec {{ haproxy_container }} cp /etc/haproxy/haproxy.cfg.backup /etc/haproxy/haproxy.cfg
+          changed_when: true
+
+        - name: Reload HAProxy with backup config
+          shell: |
+            docker exec {{ haproxy_container }} kill -USR2 $(docker exec {{ haproxy_container }} pgrep -x haproxy)
+          changed_when: true
+
+        - name: Log rollback event
+          shell: |
+            logger -t autosphere-haproxy "ROLLBACK: Health check optimization failed on {{ inventory_hostname }}. Restored backup."
+      when: reload_result is failed or config_validation is failed

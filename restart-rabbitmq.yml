@@ -1,0 +1,124 @@
+---
+# AutoSphere Playbook: Rolling Restart RabbitMQ Cluster
+# Purpose: Resolve memory pressure and queue congestion issues
+# Risk: MEDIUM - Service disruption during restart
+# Estimated Time: 15 minutes
+
+- name: Rolling Restart RabbitMQ Cluster
+  hosts: rabbitmq
+  become: yes
+  serial: 1  # Rolling restart - one node at a time
+  gather_facts: yes
+  
+  vars:
+    rabbitmq_container_name: "rabbitmq"
+    wait_time: 60
+    max_memory_threshold: 80
+    
+  tasks:
+    - name: Display incident information
+      debug:
+        msg: "Rolling restart of RabbitMQ for incident {{ incident_id | default('N/A') }}"
+      
+    - name: Check if RabbitMQ container exists
+      command: docker ps -a --filter name={{ rabbitmq_container_name }} --format "{{ '{{' }}.Names{{ '}}' }}"
+      register: rabbitmq_check
+      changed_when: false
+      
+    - name: Fail if RabbitMQ not found
+      fail:
+        msg: "RabbitMQ container '{{ rabbitmq_container_name }}' not found"
+      when: rabbitmq_check.stdout == ""
+      
+    - name: Get pre-restart cluster status
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl cluster_status
+      register: pre_cluster_status
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display pre-restart cluster status
+      debug:
+        var: pre_cluster_status.stdout_lines
+        
+    - name: Get queue depths before restart
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl list_queues name messages
+      register: pre_queue_depths
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display queue depths
+      debug:
+        var: pre_queue_depths.stdout_lines
+        
+    - name: Check memory usage
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl status | grep -A 10 memory
+      register: memory_status
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Stop RabbitMQ app (keep Erlang running)
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl stop_app
+      register: stop_result
+      
+    - name: Wait for graceful stop
+      pause:
+        seconds: 10
+        
+    - name: Start RabbitMQ app
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl start_app
+      register: start_result
+      
+    - name: Wait for node to rejoin cluster
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl cluster_status
+      register: rejoin_status
+      until: "'running' in rejoin_status.stdout"
+      retries: 12
+      delay: 5
+      
+    - name: Verify node rejoined successfully
+      debug:
+        msg: "Node rejoined cluster successfully"
+      when: rejoin_status is succeeded
+      
+    - name: Get post-restart cluster status
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl cluster_status
+      register: post_cluster_status
+      changed_when: false
+      
+    - name: Verify all nodes are running
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl cluster_status | grep -c "running"
+      register: running_nodes
+      changed_when: false
+      failed_when: running_nodes.stdout|int < 1
+      
+    - name: Check queue synchronization
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl list_queues name synchronised_slave_pids
+      register: queue_sync
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Get final memory status
+      shell: |
+        docker exec {{ rabbitmq_container_name }} rabbitmqctl status | grep -A 10 memory
+      register: final_memory
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Summary report
+      debug:
+        msg:
+          - "=== RabbitMQ Restart Summary ==="
+          - "Incident ID: {{ incident_id | default('N/A') }}"
+          - "Node: {{ ansible_hostname }}"
+          - "Cluster Status: {{ 'Healthy' if rejoin_status is succeeded else 'Failed' }}"
+          - "Running Nodes: {{ running_nodes.stdout }}"
+          - "Restart Time: {{ ansible_date_time.iso8601 }}"

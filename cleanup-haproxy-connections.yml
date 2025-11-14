@@ -1,0 +1,202 @@
+---
+# HAProxy Connection Pool Cleanup Playbook
+# Handles: High connection count, connection pool exhaustion, TIME_WAIT sockets
+# Risk: Low (no service restart, only connection cleanup)
+# Estimated Time: 20-30 seconds
+
+- name: Clean HAProxy Connection Pool - Kolla-Ansible
+  hosts: "{{ target_host | default('control') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    haproxy_container: haproxy
+    max_connections_threshold: 2000
+    time_wait_threshold: 500
+    frontend_name: "{{ target_frontend | default('all') }}"  # e.g., keystone-public, nova-api
+    action: "{{ cleanup_action | default('soft') }}"  # soft, aggressive, restart
+
+  pre_tasks:
+    - name: Get current connection count
+      shell: |
+        docker exec {{ haproxy_container }} ss -tan | grep -c ESTABLISHED || true
+      register: current_connections
+      changed_when: false
+
+    - name: Get TIME_WAIT connection count
+      shell: |
+        docker exec {{ haproxy_container }} ss -tan | grep -c TIME_WAIT || true
+      register: timewait_connections
+      changed_when: false
+
+    - name: Display connection statistics
+      debug:
+        msg: |
+          Connection Statistics:
+          - ESTABLISHED: {{ current_connections.stdout }}
+          - TIME_WAIT: {{ timewait_connections.stdout }}
+          - Threshold: {{ max_connections_threshold }}
+
+    - name: Get HAProxy frontend stats
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "^[^#]" | grep "FRONTEND" | cut -d',' -f1,5,7,8,9
+      register: frontend_stats
+      changed_when: false
+
+    - name: Display frontend connection stats
+      debug:
+        msg: "{{ frontend_stats.stdout_lines }}"
+
+  tasks:
+    - name: Action - Soft cleanup (drain idle connections)
+      block:
+        - name: Reduce HAProxy maxconn dynamically
+          shell: |
+            echo "set maxconn global 1000" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          changed_when: true
+
+        - name: Wait for connections to drain naturally
+          pause:
+            seconds: 10
+
+        - name: Restore maxconn to normal
+          shell: |
+            echo "set maxconn global 4000" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          changed_when: true
+
+        - name: Clear session table entries (if supported)
+          shell: |
+            echo "clear table" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          changed_when: true
+          failed_when: false
+      when: action == 'soft'
+
+    - name: Action - Aggressive cleanup (force close idle)
+      block:
+        - name: Disable specific frontend temporarily
+          shell: |
+            echo "disable frontend {{ item }}" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          loop: "{{ frontend_stats.stdout_lines | map('regex_replace', '^([^,]+).*', '\\1') | list }}"
+          when: 
+            - frontend_name == 'all' or item == frontend_name
+            - item != 'stats'
+          changed_when: true
+
+        - name: Wait for active connections to finish
+          pause:
+            seconds: 5
+
+        - name: Re-enable frontends
+          shell: |
+            echo "enable frontend {{ item }}" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+          loop: "{{ frontend_stats.stdout_lines | map('regex_replace', '^([^,]+).*', '\\1') | list }}"
+          when: 
+            - frontend_name == 'all' or item == frontend_name
+            - item != 'stats'
+          changed_when: true
+
+        - name: Tune kernel TCP settings for faster TIME_WAIT cleanup
+          sysctl:
+            name: "{{ item.name }}"
+            value: "{{ item.value }}"
+            state: present
+            sysctl_set: yes
+          loop:
+            - { name: 'net.ipv4.tcp_tw_reuse', value: '1' }
+            - { name: 'net.ipv4.tcp_fin_timeout', value: '30' }
+            - { name: 'net.ipv4.tcp_keepalive_time', value: '600' }
+            - { name: 'net.ipv4.tcp_keepalive_intvl', value: '30' }
+            - { name: 'net.ipv4.tcp_keepalive_probes', value: '3' }
+          changed_when: true
+      when: action == 'aggressive'
+
+    - name: Action - Full HAProxy restart (last resort)
+      block:
+        - name: Backup current HAProxy state
+          shell: |
+            echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock > /tmp/haproxy_stat_backup.txt
+          changed_when: false
+
+        - name: Restart HAProxy container
+          docker_container:
+            name: "{{ haproxy_container }}"
+            state: started
+            restart: yes
+          register: restart_result
+
+        - name: Wait for HAProxy to be healthy
+          shell: |
+            docker exec {{ haproxy_container }} pgrep -x haproxy
+          register: haproxy_health
+          until: haproxy_health.rc == 0
+          retries: 6
+          delay: 5
+          changed_when: false
+      when: action == 'restart'
+
+    - name: Post-Check - Get updated connection count
+      shell: |
+        docker exec {{ haproxy_container }} ss -tan | grep -c ESTABLISHED || true
+      register: connections_after
+      changed_when: false
+
+    - name: Post-Check - Get updated TIME_WAIT count
+      shell: |
+        docker exec {{ haproxy_container }} ss -tan | grep -c TIME_WAIT || true
+      register: timewait_after
+      changed_when: false
+
+    - name: Post-Check - Verify frontend health
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "FRONTEND" | grep -v "DRAIN" | wc -l
+      register: healthy_frontends
+      changed_when: false
+
+    - name: Verify connection improvement
+      assert:
+        that:
+          - connections_after.stdout | int < current_connections.stdout | int
+        fail_msg: "Connection count did not decrease. Before: {{ current_connections.stdout }}, After: {{ connections_after.stdout }}"
+        success_msg: "Connection count reduced. Before: {{ current_connections.stdout }}, After: {{ connections_after.stdout }}"
+
+    - name: Test API endpoint responsiveness
+      uri:
+        url: "https://{{ internal_vip | default('10.0.0.100') }}:5000/v3"
+        method: GET
+        status_code: [200, 300, 401]
+        timeout: 5
+        validate_certs: no
+      register: api_response_time
+      failed_when: false
+
+  post_tasks:
+    - name: Calculate connection reduction
+      set_fact:
+        connection_reduction: "{{ ((current_connections.stdout | int - connections_after.stdout | int) / current_connections.stdout | int * 100) | round(2) }}"
+
+    - name: Report connection cleanup outcome
+      debug:
+        msg: |
+          Connection Cleanup Summary:
+          - Action: {{ action }}
+          - Before: {{ current_connections.stdout }} ESTABLISHED, {{ timewait_connections.stdout }} TIME_WAIT
+          - After: {{ connections_after.stdout }} ESTABLISHED, {{ timewait_after.stdout }} TIME_WAIT
+          - Reduction: {{ connection_reduction }}%
+          - Healthy Frontends: {{ healthy_frontends.stdout }}
+          - API Response: {{ 'OK' if api_response_time.status == 200 else 'DEGRADED' }}
+          - Resolution Time: ~{{ '30' if action == 'soft' else '45' if action == 'aggressive' else '60' }} seconds
+
+    - name: Log to syslog
+      shell: |
+        logger -t autosphere-haproxy "Connection pool cleaned on {{ inventory_hostname }}. Reduced {{ connection_reduction }}% ({{ action }} mode)"
+
+    - name: Update monitoring dashboard
+      shell: |
+        echo "$(date +%s),{{ connections_after.stdout }},{{ timewait_after.stdout }}" >> /var/log/autosphere/haproxy_connections.csv
+      changed_when: false
+
+  handlers:
+    - name: Restore maxconn if failed
+      shell: |
+        echo "set maxconn global 4000" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+      when: action == 'soft'

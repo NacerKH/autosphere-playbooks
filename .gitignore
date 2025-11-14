@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Ansible
+*.retry
+.ansible/
+ansible.log
+/tmp/ansible*
+
+# AWX
+.tower_cli.cfg
+.awx_cli.cfg
+
+# Logs and reports
+/tmp/autosphere_incident_*.log
+/tmp/*_backup_*/
+/tmp/*_recovery_*/
+*.log
+
+# Ansible facts cache
+/tmp/ansible_facts/
+
+# Secrets (DO NOT COMMIT!)
+*.pem
+*.key
+*_rsa
+*_rsa.pub
+passwords.yml
+secrets.yml
+vault_pass.txt
+.vault_pass
+
+# OS Files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+.*.swp
+
+# Environment
+.env
+.envrc
+venv/
+env/
+
+# Test outputs
+test_output/
+junit*.xml

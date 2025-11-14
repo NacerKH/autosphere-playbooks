@@ -1,0 +1,284 @@
+---
+# AutoSphere Playbook: Cascading Failure Recovery
+# Purpose: Intelligent recovery sequence for multi-service failures
+# Risk: CRITICAL - Improper order can worsen outage
+# Estimated Time: 30 minutes
+# Last Updated: 2025
+# 
+# Intelligence: This playbook identifies root causes and restarts services
+# in the correct dependency order to prevent further cascading failures
+
+- name: Cascading Failure Root Cause Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    failed_services: "{{ failed_services | default([]) }}"
+    
+    # OpenStack dependency graph
+    service_dependencies:
+      rabbitmq: ["nova-api", "nova-conductor", "nova-scheduler", "neutron-server", "cinder-api", "cinder-scheduler", "heat-engine"]
+      mariadb: ["keystone", "nova-api", "neutron-server", "cinder-api", "glance-api"]
+      memcached: ["horizon", "keystone"]
+      haproxy: ["keystone", "nova-api", "neutron-server", "cinder-api", "glance-api"]
+      
+    # Service restart priority (lower = earlier)
+    restart_priority:
+      mariadb: 1
+      rabbitmq: 2
+      memcached: 3
+      haproxy: 4
+      keystone: 5
+      placement-api: 6
+      glance-api: 7
+      nova-api: 8
+      nova-conductor: 9
+      nova-scheduler: 10
+      neutron-server: 11
+      cinder-api: 12
+      nova-compute: 13
+      neutron-openvswitch-agent: 14
+      cinder-volume: 15
+      
+  tasks:
+    - name: "[ANALYSIS] Identify root cause service"
+      shell: |
+        # Check infrastructure services first
+        root_cause=""
+        for service in rabbitmq mariadb haproxy memcached; do
+          if docker ps --filter "name=$service" --format "{%raw%}{{.Status}}{%endraw%}" | grep -q "Up"; then
+            continue
+          else
+            echo "$service"
+            break
+          fi
+        done
+      register: root_cause_detection
+      
+    - name: "[ANALYSIS] Correlate downstream failures"
+      shell: |
+        root="{{ root_cause_detection.stdout }}"
+        if [ -n "$root" ]; then
+          echo "Root cause identified: $root"
+          # List affected downstream services
+          case $root in
+            rabbitmq)
+              echo "Affected: nova-api nova-conductor nova-scheduler neutron-server cinder-api heat-engine"
+              ;;
+            mariadb)
+              echo "Affected: keystone nova-api neutron-server cinder-api glance-api"
+              ;;
+            haproxy)
+              echo "Affected: All API services"
+              ;;
+          esac
+        else
+          echo "No clear root cause - multiple independent failures"
+        fi
+      register: correlation_analysis
+      
+    - name: "[ANALYSIS] Determine restart sequence"
+      set_fact:
+        restart_sequence: "{{ failed_services | sort(attribute='priority') }}"
+      vars:
+        priority: "{{ restart_priority[item] | default(99) }}"
+      
+    - name: "[BACKUP] Snapshot all container states"
+      shell: |
+        mkdir -p /tmp/container_snapshots_{{ incident_id }}
+        for container in {{ failed_services | join(' ') }}; do
+          docker inspect $container > /tmp/container_snapshots_{{ incident_id }}/${container}.json
+          docker logs --tail 200 $container > /tmp/container_snapshots_{{ incident_id }}/${container}.log 2>&1
+        done
+      
+    - name: "[DECISION] Auto-approve or require human?"
+      set_fact:
+        requires_human: "{{ root_cause_detection.stdout in ['mariadb', 'rabbitmq'] }}"
+        
+    - name: "[PAUSE] Wait for human approval if critical"
+      pause:
+        prompt: |
+          🚨 CRITICAL ROOT CAUSE DETECTED: {{ root_cause_detection.stdout }}
+          
+          This will restart infrastructure services affecting:
+          {{ correlation_analysis.stdout }}
+          
+          Restart sequence: {{ restart_sequence | join(' → ') }}
+          
+          Press ENTER to continue or Ctrl+C to abort
+      when: requires_human
+      
+    - name: "[EXECUTE] Phase 1 - Restart root cause service"
+      when: root_cause_detection.stdout != ""
+      block:
+        - name: Restart infrastructure service
+          shell: |
+            service="{{ root_cause_detection.stdout }}"
+            echo "Restarting $service..."
+            docker restart $service
+            
+        - name: Wait for service ready
+          shell: |
+            service="{{ root_cause_detection.stdout }}"
+            case $service in
+              rabbitmq)
+                docker exec rabbitmq rabbitmqctl await_startup
+                ;;
+              mariadb)
+                docker exec mariadb mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} -e "SELECT 1"
+                ;;
+              haproxy)
+                sleep 10
+                ;;
+              memcached)
+                sleep 5
+                ;;
+            esac
+          register: root_service_ready
+          retries: 10
+          delay: 10
+          until: root_service_ready.rc == 0
+          
+    - name: "[EXECUTE] Phase 2 - Restart dependent services in order"
+      shell: |
+        # Restart services in priority order with delays
+        {% for service in restart_sequence %}
+        echo "Restarting {{ service }}..."
+        docker restart {{ service }}
+        sleep 15
+        {% endfor %}
+      
+    - name: "[VERIFY] Check all service health"
+      shell: |
+        failed=""
+        for service in {{ failed_services | join(' ') }}; do
+          if docker ps --filter "name=$service" --format "{%raw%}{{.Status}}{%endraw%}" | grep -q "Up"; then
+            echo "✅ $service: HEALTHY"
+          else
+            echo "❌ $service: FAILED"
+            failed="$failed $service"
+          fi
+        done
+        
+        if [ -n "$failed" ]; then
+          echo "FAILED_SERVICES: $failed"
+          exit 1
+        fi
+      register: health_verification
+      
+    - name: "[VERIFY] Check OpenStack API endpoints"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack endpoint list --format json > /tmp/endpoints_{{ incident_id }}.json
+        
+        # Test each service
+        for service in compute network volume image; do
+          openstack ${service} service list > /dev/null 2>&1 && echo "✅ $service API" || echo "❌ $service API"
+        done
+      register: api_check
+      ignore_errors: yes
+      
+    - name: "[VERIFY] Verify RabbitMQ connections"
+      when: "'rabbitmq' in failed_services"
+      shell: |
+        docker exec rabbitmq rabbitmqctl list_connections --formatter json | \
+          jq '.[] | select(.state == "running") | .peer_host' | wc -l
+      register: rabbitmq_connections
+      
+    - name: "[VERIFY] Check database connections"
+      when: "'mariadb' in failed_services"
+      shell: |
+        docker exec mariadb mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          -e "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE command != 'Sleep'"
+      register: db_connections
+      
+    - name: "[POST-CHECK] Monitor for 5 minutes"
+      shell: |
+        echo "Monitoring services for stability..."
+        for i in {1..5}; do
+          sleep 60
+          failures=0
+          for service in {{ failed_services | join(' ') }}; do
+            docker ps --filter "name=$service" --format "{%raw%}{{.Status}}{%endraw%}" | grep -q "Up" || ((failures++))
+          done
+          echo "Minute $i: $failures failures detected"
+          if [ $failures -gt 0 ]; then
+            exit 1
+          fi
+        done
+      register: stability_check
+      async: 360
+      poll: 60
+      
+    - name: "[REPORT] Generate comprehensive report"
+      copy:
+        content: |
+          ========================================
+          AUTOSPHERE CASCADING FAILURE RECOVERY
+          ========================================
+          
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          
+          ROOT CAUSE ANALYSIS:
+          {{ correlation_analysis.stdout }}
+          
+          RESTART SEQUENCE:
+          {{ restart_sequence | join(' → ') }}
+          
+          SERVICE HEALTH:
+          {{ health_verification.stdout }}
+          
+          API VERIFICATION:
+          {{ api_check.stdout }}
+          
+          {% if 'rabbitmq' in failed_services %}
+          RabbitMQ Connections: {{ rabbitmq_connections.stdout }}
+          {% endif %}
+          
+          {% if 'mariadb' in failed_services %}
+          Database Connections: {{ db_connections.stdout }}
+          {% endif %}
+          
+          STABILITY CHECK: {{ 'PASS' if stability_check.rc == 0 else 'FAIL' }}
+          
+          RECOVERY TIME: {{ (ansible_date_time.epoch | int) - (incident_timestamp | default(ansible_date_time.epoch | int)) }} seconds
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_cascade.log"
+        
+    - name: "[ALERT] Recovery complete"
+      debug:
+        msg: |
+          ✅ Cascading failure recovery completed
+          
+          Root Cause: {{ root_cause_detection.stdout | default('Multiple independent failures') }}
+          Services Recovered: {{ failed_services | length }}
+          Status: {{ 'HEALTHY' if health_verification.rc == 0 else 'DEGRADED' }}
+          
+          Report: /tmp/autosphere_incident_{{ incident_id }}_cascade.log
+          
+  rescue:
+    - name: "[ROLLBACK] Emergency recovery"
+      shell: |
+        echo "Emergency rollback initiated..."
+        # Restart all services again
+        for service in mariadb rabbitmq haproxy keystone nova-api neutron-server cinder-api; do
+          docker restart $service 2>/dev/null || true
+          sleep 10
+        done
+      
+    - name: "[ALERT] Recovery failed"
+      debug:
+        msg: |
+          ❌ CASCADING FAILURE RECOVERY FAILED
+          
+          Manual intervention required:
+          1. Check /tmp/autosphere_incident_{{ incident_id }}_cascade.log
+          2. Review container logs in /tmp/container_snapshots_{{ incident_id }}/
+          3. Consider full OpenStack reconfiguration: kolla-ansible reconfigure
+          4. Contact SRE team immediately
+          
+    - fail:
+        msg: "Cascading failure recovery failed - escalating to human"

@@ -1,0 +1,129 @@
+---
+# AutoSphere Playbook: Keystone Token Cleanup and Recovery
+# Purpose: Fix Keystone authentication issues and token table bloat
+# Risk: LOW - Brief auth disruption during restart
+# Estimated Time: 5 minutes
+# Last Updated: 2025
+
+- name: Keystone Token Cleanup and Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    keystone_container: "keystone"
+    token_flush_enabled: "{{ flush_tokens | default('true') }}"
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify Keystone container"
+      shell: docker ps --filter "name={{ keystone_container }}" --format "{%raw%}{{.Names}}{%endraw%}"
+      register: container_check
+      failed_when: container_check.stdout == ""
+      
+    - name: "[DIAGNOSIS] Check token table size"
+      shell: |
+        docker exec {{ keystone_container }} mysql -h {{ lookup('env', 'MARIADB_HOST') | default('mariadb') }} \
+          -u keystone -p{{ lookup('env', 'KEYSTONE_DB_PASSWORD') }} keystone \
+          -e "SELECT COUNT(*) as token_count FROM token" 2>/dev/null || echo "0"
+      register: token_count
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Check Keystone API health"
+      shell: |
+        curl -s -o /dev/null -w "%{http_code}" http://{{ ansible_default_ipv4.address }}:5000/v3
+      register: api_health
+      
+    - name: "[DIAGNOSIS] Check authentication performance"
+      shell: |
+        time docker exec {{ keystone_container }} bash -c \
+          "curl -s http://localhost:5000/v3/auth/tokens \
+          -H 'Content-Type: application/json' \
+          -d '{\"auth\":{\"identity\":{\"methods\":[\"password\"],\"password\":{\"user\":{\"domain\":{\"name\":\"Default\"},\"name\":\"admin\",\"password\":\"'{{ lookup('env', 'KEYSTONE_ADMIN_PASSWORD') }}'\"}}},\"scope\":{\"project\":{\"domain\":{\"name\":\"Default\"},\"name\":\"admin\"}}}}' \
+          2>&1 | head -1"
+      register: auth_performance
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Save current Keystone state"
+      shell: |
+        docker logs --tail 200 {{ keystone_container }} > /tmp/keystone_{{ incident_id }}.log 2>&1
+        
+    - name: "[EXECUTE] Flush expired tokens"
+      shell: |
+        docker exec {{ keystone_container }} keystone-manage token_flush
+      when: token_flush_enabled == 'true'
+      register: token_flush_result
+      
+    - name: "[EXECUTE] Restart Keystone"
+      shell: docker restart {{ keystone_container }}
+      
+    - name: "[VERIFY] Wait for Keystone startup"
+      wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 5000
+        timeout: 60
+        
+    - name: "[VERIFY] Test authentication"
+      shell: |
+        docker exec {{ keystone_container }} bash -c \
+          "curl -s http://localhost:5000/v3/auth/tokens \
+          -H 'Content-Type: application/json' \
+          -d '{\"auth\":{\"identity\":{\"methods\":[\"password\"],\"password\":{\"user\":{\"domain\":{\"name\":\"Default\"},\"name\":\"admin\",\"password\":\"'{{ lookup('env', 'KEYSTONE_ADMIN_PASSWORD') }}'\"}}},\"scope\":{\"project\":{\"domain\":{\"name\":\"Default\"},\"name\":\"admin\"}}}}' \
+          -w '\\nHTTP_CODE:%{http_code}\\n'"
+      register: auth_test
+      retries: 5
+      delay: 10
+      until: auth_test.stdout.find('HTTP_CODE:201') != -1
+      
+    - name: "[VERIFY] Check token table after cleanup"
+      shell: |
+        docker exec {{ keystone_container }} mysql -h {{ lookup('env', 'MARIADB_HOST') | default('mariadb') }} \
+          -u keystone -p{{ lookup('env', 'KEYSTONE_DB_PASSWORD') }} keystone \
+          -e "SELECT COUNT(*) as token_count FROM token" 2>/dev/null || echo "0"
+      register: token_count_after
+      ignore_errors: yes
+      
+    - name: "[POST-CHECK] Verify OpenStack CLI works"
+      shell: |
+        docker exec {{ keystone_container }} openstack token issue -f json
+      register: cli_test
+      
+    - name: "[REPORT] Generate report"
+      copy:
+        content: |
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Action: Keystone Token Cleanup & Recovery
+          
+          DIAGNOSIS:
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          API Health Before: {{ api_health.stdout }}
+          Tokens Before: {{ token_count.stdout | regex_search('\\d+') | default('N/A') }}
+          Tokens After: {{ token_count_after.stdout | regex_search('\\d+') | default('N/A') }}
+          
+          RESULTS:
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Token Flush: {{ 'SUCCESS' if token_flush_result.rc == 0 else 'SKIPPED' }}
+          Authentication: {{ 'WORKING' if auth_test.rc == 0 else 'FAILED' }}
+          CLI Test: {{ 'PASS' if cli_test.rc == 0 else 'FAIL' }}
+          
+          PERFORMANCE:
+          {{ auth_performance.stdout | default('N/A') }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_keystone.log"
+        
+    - name: "[ALERT] Success"
+      debug:
+        msg: |
+          ✅ Keystone recovered
+          Incident: {{ incident_id }}
+          Authentication: WORKING
+          Tokens cleaned: {{ (token_count.stdout | regex_search('\\d+') | int) - (token_count_after.stdout | regex_search('\\d+') | int) }}
+          
+  rescue:
+    - name: "[ROLLBACK] Emergency restart"
+      shell: docker restart {{ keystone_container }}
+      ignore_errors: yes
+      
+    - fail:
+        msg: "Keystone recovery failed"

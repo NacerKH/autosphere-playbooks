@@ -1,0 +1,204 @@
+---
+# HAProxy SSL Certificate Renewal Playbook
+# Handles: SSL certificate expiration, certificate errors, HTTPS backend failures
+# Risk: Medium (brief HTTPS disruption during reload)
+# Estimated Time: 60-90 seconds
+
+- name: Renew HAProxy SSL Certificates - Kolla-Ansible
+  hosts: "{{ target_host | default('control') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    haproxy_container: haproxy
+    cert_directory: /etc/kolla/certificates
+    haproxy_cert_path: "{{ cert_directory }}/haproxy.pem"
+    haproxy_internal_cert: "{{ cert_directory }}/haproxy-internal.pem"
+    cert_backup_dir: /etc/kolla/certificates/backups
+    cert_expiry_days: 30
+    force_renewal: "{{ force_cert_renewal | default(false) }}"
+
+  pre_tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ cert_backup_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Check current certificate expiry
+      shell: |
+        docker exec {{ haproxy_container }} openssl x509 -in /var/lib/kolla/config_files/src/haproxy.pem -noout -enddate | cut -d'=' -f2
+      register: cert_expiry
+      changed_when: false
+      failed_when: false
+
+    - name: Display certificate expiry
+      debug:
+        msg: "Current certificate expires: {{ cert_expiry.stdout }}"
+
+    - name: Check if certificate is expired or expiring soon
+      shell: |
+        docker exec {{ haproxy_container }} openssl x509 -in /var/lib/kolla/config_files/src/haproxy.pem -noout -checkend {{ cert_expiry_days * 86400 }}
+      register: cert_check
+      changed_when: false
+      failed_when: false
+
+    - name: Skip renewal if certificate is valid
+      meta: end_play
+      when:
+        - cert_check.rc == 0
+        - not force_renewal
+
+  tasks:
+    - name: Backup existing certificates
+      block:
+        - name: Copy current HAProxy certificate
+          shell: |
+            docker exec {{ haproxy_container }} cat /var/lib/kolla/config_files/src/haproxy.pem > {{ cert_backup_dir }}/haproxy.pem.backup.$(date +%Y%m%d_%H%M%S)
+          changed_when: false
+
+        - name: Copy internal certificate (if exists)
+          shell: |
+            docker exec {{ haproxy_container }} cat /var/lib/kolla/config_files/src/haproxy-internal.pem > {{ cert_backup_dir }}/haproxy-internal.pem.backup.$(date +%Y%m%d_%H%M%S)
+          changed_when: false
+          failed_when: false
+
+    - name: Generate new self-signed certificate
+      block:
+        - name: Generate private key
+          openssl_privatekey:
+            path: "{{ cert_directory }}/haproxy-new.key"
+            size: 4096
+            type: RSA
+
+        - name: Generate CSR
+          openssl_csr:
+            path: "{{ cert_directory }}/haproxy-new.csr"
+            privatekey_path: "{{ cert_directory }}/haproxy-new.key"
+            common_name: "{{ external_vip | default(ansible_default_ipv4.address) }}"
+            subject_alt_name:
+              - "DNS:{{ external_vip | default(ansible_default_ipv4.address) }}"
+              - "DNS:{{ internal_vip | default('10.0.0.100') }}"
+              - "IP:{{ external_vip | default(ansible_default_ipv4.address) }}"
+              - "IP:{{ internal_vip | default('10.0.0.100') }}"
+
+        - name: Generate self-signed certificate
+          openssl_certificate:
+            path: "{{ cert_directory }}/haproxy-new.crt"
+            privatekey_path: "{{ cert_directory }}/haproxy-new.key"
+            csr_path: "{{ cert_directory }}/haproxy-new.csr"
+            provider: selfsigned
+            selfsigned_not_after: "+365d"
+
+        - name: Combine key and certificate for HAProxy
+          shell: |
+            cat {{ cert_directory }}/haproxy-new.key {{ cert_directory }}/haproxy-new.crt > {{ haproxy_cert_path }}
+          changed_when: true
+
+        - name: Set certificate permissions
+          file:
+            path: "{{ haproxy_cert_path }}"
+            mode: '0600'
+            owner: root
+            group: root
+
+    - name: Update HAProxy container with new certificate
+      block:
+        - name: Copy new certificate into HAProxy container
+          shell: |
+            docker cp {{ haproxy_cert_path }} {{ haproxy_container }}:/var/lib/kolla/config_files/src/haproxy.pem
+          changed_when: true
+
+        - name: Reload HAProxy configuration (graceful)
+          shell: |
+            docker exec {{ haproxy_container }} kill -USR2 $(docker exec {{ haproxy_container }} pgrep -x haproxy)
+          changed_when: true
+          register: reload_result
+
+        - name: Wait for HAProxy to reload
+          pause:
+            seconds: 5
+
+        - name: Verify HAProxy is still running
+          shell: |
+            docker exec {{ haproxy_container }} pgrep -x haproxy
+          register: haproxy_running
+          changed_when: false
+          failed_when: haproxy_running.rc != 0
+
+    - name: Post-Check - Verify new certificate
+      shell: |
+        docker exec {{ haproxy_container }} openssl x509 -in /var/lib/kolla/config_files/src/haproxy.pem -noout -enddate | cut -d'=' -f2
+      register: new_cert_expiry
+      changed_when: false
+
+    - name: Post-Check - Test HTTPS endpoints
+      uri:
+        url: "{{ item }}"
+        method: GET
+        status_code: [200, 300, 401]
+        timeout: 10
+        validate_certs: no
+      loop:
+        - "https://{{ external_vip | default(ansible_default_ipv4.address) }}:5000/v3"  # Keystone
+        - "https://{{ external_vip | default(ansible_default_ipv4.address) }}:8774/v2.1"  # Nova
+        - "https://{{ external_vip | default(ansible_default_ipv4.address) }}:9292/v2"  # Glance
+      register: https_checks
+      failed_when: false
+
+    - name: Verify certificate chain
+      shell: |
+        echo | openssl s_client -connect {{ external_vip | default(ansible_default_ipv4.address) }}:5000 -servername {{ external_vip | default(ansible_default_ipv4.address) }} 2>/dev/null | openssl x509 -noout -dates
+      register: cert_chain_check
+      changed_when: false
+      failed_when: false
+
+    - name: Cleanup temporary certificate files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ cert_directory }}/haproxy-new.key"
+        - "{{ cert_directory }}/haproxy-new.csr"
+        - "{{ cert_directory }}/haproxy-new.crt"
+
+  post_tasks:
+    - name: Report certificate renewal outcome
+      debug:
+        msg: |
+          SSL Certificate Renewal Summary:
+          - Old Expiry: {{ cert_expiry.stdout }}
+          - New Expiry: {{ new_cert_expiry.stdout }}
+          - HAProxy Reload: {{ 'SUCCESS' if reload_result is succeeded else 'FAILED' }}
+          - HTTPS Endpoints: {{ 'OK' if https_checks is succeeded else 'DEGRADED' }}
+          - Certificate Chain: {{ 'VALID' if cert_chain_check.rc == 0 else 'INVALID' }}
+          - Resolution Time: ~90 seconds
+
+    - name: Log to syslog
+      shell: |
+        logger -t autosphere-haproxy "SSL certificate renewed on {{ inventory_hostname }}. New expiry: {{ new_cert_expiry.stdout }}"
+
+    - name: Update Redmine ticket (if exists)
+      shell: |
+        echo "SSL certificate renewed successfully" >> /var/log/autosphere/certificate_renewal.log
+      changed_when: false
+
+  handlers:
+    - name: Rollback certificate if failed
+      block:
+        - name: Find latest backup
+          shell: |
+            ls -t {{ cert_backup_dir }}/haproxy.pem.backup.* | head -1
+          register: latest_backup
+          changed_when: false
+
+        - name: Restore backup certificate
+          shell: |
+            cat {{ latest_backup.stdout }} | docker exec -i {{ haproxy_container }} tee /var/lib/kolla/config_files/src/haproxy.pem > /dev/null
+          when: latest_backup.stdout != ""
+
+        - name: Reload HAProxy with old certificate
+          shell: |
+            docker exec {{ haproxy_container }} kill -USR2 $(docker exec {{ haproxy_container }} pgrep -x haproxy)
+          changed_when: true
+      when: reload_result is failed

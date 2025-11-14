@@ -1,0 +1,349 @@
+---
+# AutoSphere Playbook: Grafana Recovery (Kolla 2025.1)
+# Purpose: Fix Grafana restart loops, exit code 137 (SIGKILL/OOM)
+# Risk: LOW - Grafana is monitoring only, not critical path
+# Estimated Time: 10 minutes
+# Last Updated: 2025
+#
+# SPECIFIC TO YOUR ISSUE: Restarting (137) 8 seconds ago
+
+- name: Grafana Container Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    grafana_container: "grafana"
+    prometheus_container: "prometheus_server"
+    
+  tasks:
+    - name: "[DIAGNOSIS] Check Grafana exit code and logs"
+      shell: |
+        echo "=== Container Status ==="
+        docker ps -a --filter "name={{ grafana_container }}" --format "Status: {%raw%}{{.Status}}{%endraw%}"
+        
+        echo ""
+        echo "=== Last 100 Log Lines ==="
+        docker logs --tail 100 {{ grafana_container }} 2>&1 || true
+        
+        echo ""
+        echo "=== Check for OOM Killer ==="
+        dmesg | grep -i "{{ grafana_container }}" | grep -i "oom" | tail -20 || echo "No OOM events found"
+      register: grafana_diagnosis
+      
+    - name: "[DIAGNOSIS] Check Docker memory limits"
+      shell: |
+        docker inspect {{ grafana_container }} --format '{%raw%}{{.HostConfig.Memory}}{%endraw%}' || echo "0"
+      register: memory_limit
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Check Grafana configuration"
+      shell: |
+        docker exec {{ grafana_container }} cat /etc/grafana/grafana.ini 2>/dev/null || \
+        docker run --rm --volumes-from {{ grafana_container }} \
+          quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble \
+          cat /etc/grafana/grafana.ini 2>/dev/null || \
+        echo "Cannot read grafana.ini"
+      register: grafana_config
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Check Prometheus datasource UID"
+      shell: |
+        # Check if prometheus_server is running
+        if docker ps --filter "name={{ prometheus_container }}" --format "{%raw%}{{.Names}}{%endraw%}" | grep -q prometheus; then
+          echo "Prometheus: RUNNING"
+          
+          # Try to get datasource config from Grafana volume
+          docker run --rm --volumes-from {{ grafana_container }} \
+            quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble \
+            cat /var/lib/grafana/grafana.db 2>/dev/null && echo "Database accessible" || echo "Cannot access grafana.db"
+        else
+          echo "Prometheus: NOT RUNNING"
+        fi
+      register: prometheus_check
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Save Grafana data before fix"
+      shell: |
+        mkdir -p /tmp/grafana_backup_{{ incident_id }}
+        
+        # Backup Grafana volume data
+        docker run --rm --volumes-from {{ grafana_container }} \
+          -v /tmp/grafana_backup_{{ incident_id }}:/backup \
+          quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble \
+          tar czf /backup/grafana_data.tar.gz /var/lib/grafana 2>/dev/null || true
+          
+        # Backup config
+        docker run --rm --volumes-from {{ grafana_container }} \
+          -v /tmp/grafana_backup_{{ incident_id }}:/backup \
+          quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble \
+          cp /etc/grafana/grafana.ini /backup/ 2>/dev/null || true
+          
+        echo "Backup saved to /tmp/grafana_backup_{{ incident_id }}/"
+        ls -lh /tmp/grafana_backup_{{ incident_id }}/
+      
+    - name: "[DECISION] Determine fix strategy based on diagnosis"
+      set_fact:
+        is_oom_issue: "{{ 'oom' in grafana_diagnosis.stdout | lower or memory_limit.stdout | int == 0 }}"
+        is_datasource_issue: "{{ 'datasource' in grafana_diagnosis.stdout | lower or 'prometheus' in grafana_diagnosis.stdout | lower }}"
+        is_plugin_issue: "{{ 'plugin' in grafana_diagnosis.stdout | lower }}"
+        
+    - name: "[FIX] Strategy 1 - Increase memory limits (if OOM detected)"
+      when: is_oom_issue
+      block:
+        - name: Stop Grafana
+          shell: docker stop {{ grafana_container }}
+          
+        - name: Update /etc/kolla/grafana/grafana.ini if needed
+          shell: |
+            # Kolla-ansible manages this, but we can add memory settings
+            if [ -f /etc/kolla/grafana/grafana.ini ]; then
+              grep -q "mem_limit" /etc/kolla/grafana/grafana.ini || \
+                echo "# AutoSphere - Increased memory" >> /etc/kolla/grafana/grafana.ini
+            fi
+            
+        - name: Recreate with higher memory limit
+          shell: |
+            # Get current container config
+            docker inspect {{ grafana_container }} > /tmp/grafana_inspect.json
+            
+            # Remove old container
+            docker rm {{ grafana_container }}
+            
+            # Kolla will recreate it with proper config
+            # For now, let's manually restart with memory limit
+            docker run -d \
+              --name {{ grafana_container }} \
+              --network host \
+              --memory="2g" \
+              --memory-swap="2g" \
+              --volumes-from grafana \
+              --restart unless-stopped \
+              quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble
+          ignore_errors: yes
+          
+    - name: "[FIX] Strategy 2 - Reset Prometheus datasource (if datasource issue)"
+      when: is_datasource_issue
+      block:
+        - name: Stop Grafana
+          shell: docker stop {{ grafana_container }}
+          
+        - name: Clear corrupted datasource config
+          shell: |
+            # Access Grafana volume and remove datasource provisioning
+            docker run --rm --volumes-from {{ grafana_container }} \
+              quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble \
+              sh -c "rm -f /var/lib/grafana/grafana.db-* 2>/dev/null; \
+                     rm -f /var/lib/grafana/grafana.db-shm 2>/dev/null; \
+                     rm -f /var/lib/grafana/grafana.db-wal 2>/dev/null" || true
+          ignore_errors: yes
+          
+        - name: Start Grafana
+          shell: docker start {{ grafana_container }}
+          
+    - name: "[FIX] Strategy 3 - Standard restart (no specific issue detected)"
+      when: not is_oom_issue and not is_datasource_issue
+      block:
+        - name: Stop Grafana gracefully
+          shell: docker stop --time 30 {{ grafana_container }}
+          
+        - name: Clear any locks or temp files
+          shell: |
+            docker run --rm --volumes-from {{ grafana_container }} \
+              quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble \
+              sh -c "rm -f /var/lib/grafana/*.lock 2>/dev/null" || true
+          ignore_errors: yes
+          
+        - name: Start Grafana
+          shell: docker start {{ grafana_container }}
+          
+    - name: "[VERIFY] Wait for Grafana to stabilize"
+      shell: |
+        for i in {1..12}; do
+          status=$(docker ps --filter "name={{ grafana_container }}" --format "{%raw%}{{.Status}}{%endraw%}")
+          echo "Check $i/12: $status"
+          
+          if echo "$status" | grep -q "Up"; then
+            echo "Grafana is UP"
+            sleep 10
+            # Check if it's still up
+            docker ps --filter "name={{ grafana_container }}" --format "{%raw%}{{.Status}}{%endraw%}" | grep -q "Up" && exit 0
+          fi
+          
+          sleep 10
+        done
+        
+        echo "Grafana failed to stay up"
+        exit 1
+      register: stability_check
+      retries: 1
+      delay: 5
+      
+    - name: "[VERIFY] Check Grafana web interface"
+      shell: |
+        # Wait for Grafana to be ready
+        for i in {1..30}; do
+          if curl -f -s -o /dev/null http://localhost:3000/api/health; then
+            echo "Grafana API is responding"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Grafana API not responding"
+        exit 1
+      register: api_check
+      ignore_errors: yes
+      
+    - name: "[VERIFY] Test Prometheus datasource connectivity"
+      shell: |
+        # Get Grafana admin credentials from Kolla
+        GRAFANA_PASSWORD=$(grep grafana_admin_password /etc/kolla/passwords.yml | awk '{print $2}')
+        
+        # Test datasource
+        curl -f -u "admin:${GRAFANA_PASSWORD}" \
+          http://localhost:3000/api/datasources 2>/dev/null || echo "Cannot query datasources"
+      register: datasource_check
+      ignore_errors: yes
+      
+    - name: "[POST-CHECK] Monitor for 3 minutes"
+      shell: |
+        echo "Monitoring Grafana stability for 3 minutes..."
+        for i in {1..18}; do
+          status=$(docker ps --filter "name={{ grafana_container }}" --format "{%raw%}{{.Status}}{%endraw%}")
+          echo "$(date +%H:%M:%S) - $status"
+          
+          if echo "$status" | grep -q "Restarting"; then
+            echo "FAILED: Grafana restarted again"
+            exit 1
+          fi
+          
+          sleep 10
+        done
+        echo "SUCCESS: Grafana stable for 3 minutes"
+      register: final_stability
+      async: 200
+      poll: 10
+      
+    - name: "[REPORT] Generate recovery report"
+      copy:
+        content: |
+          ========================================
+          GRAFANA RECOVERY REPORT
+          ========================================
+          
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Host: {{ ansible_hostname }}
+          
+          DIAGNOSIS:
+          {{ grafana_diagnosis.stdout }}
+          
+          Memory Limit Before: {{ memory_limit.stdout | default('Unknown') }}
+          
+          ISSUES DETECTED:
+          - OOM Issue: {{ is_oom_issue }}
+          - Datasource Issue: {{ is_datasource_issue }}
+          - Plugin Issue: {{ is_plugin_issue }}
+          
+          FIX APPLIED:
+          {% if is_oom_issue %}
+          ✅ Increased memory limits to 2GB
+          {% endif %}
+          {% if is_datasource_issue %}
+          ✅ Reset Prometheus datasource configuration
+          {% endif %}
+          
+          VERIFICATION:
+          - Container Stability: {{ 'PASS' if stability_check.rc == 0 else 'FAIL' }}
+          - Web API Response: {{ 'PASS' if api_check.rc == 0 else 'FAIL' }}
+          - Final Stability (3min): {{ 'PASS' if final_stability.rc == 0 else 'FAIL' }}
+          
+          BACKUP LOCATION:
+          /tmp/grafana_backup_{{ incident_id }}/
+          
+          GRAFANA ACCESS:
+          - URL: http://{{ ansible_default_ipv4.address }}:3000
+          - User: admin
+          - Password: Check /etc/kolla/passwords.yml
+          
+          RECOMMENDATIONS:
+          {% if is_oom_issue %}
+          - Consider permanent memory increase in Docker
+          - Review dashboard complexity
+          - Limit concurrent queries
+          {% endif %}
+          
+          {% if is_datasource_issue %}
+          - Verify Prometheus datasource UID in /etc/kolla/.env
+          - Re-provision datasources: kolla-ansible reconfigure -t grafana
+          {% endif %}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_grafana.log"
+        
+    - name: "[ALERT] Recovery result"
+      debug:
+        msg: |
+          {% if stability_check.rc == 0 and final_stability.rc == 0 %}
+          ✅ GRAFANA RECOVERED SUCCESSFULLY
+          
+          Status: HEALTHY
+          Uptime: Stable for 3+ minutes
+          Web UI: http://{{ ansible_default_ipv4.address }}:3000
+          
+          Report: /tmp/autosphere_incident_{{ incident_id }}_grafana.log
+          {% else %}
+          ⚠️  GRAFANA RECOVERY PARTIAL
+          
+          Container started but may be unstable.
+          Check logs: docker logs grafana
+          Report: /tmp/autosphere_incident_{{ incident_id }}_grafana.log
+          
+          If still failing, try:
+          1. kolla-ansible reconfigure -t grafana
+          2. Check /etc/kolla/grafana/ configuration
+          3. Review backup: /tmp/grafana_backup_{{ incident_id }}/
+          {% endif %}
+          
+  rescue:
+    - name: "[ROLLBACK] Restore from backup"
+      shell: |
+        docker stop {{ grafana_container }} || true
+        docker rm {{ grafana_container }} || true
+        
+        # Restore from backup
+        if [ -f /tmp/grafana_backup_{{ incident_id }}/grafana_data.tar.gz ]; then
+          docker run --rm --volumes-from {{ grafana_container }} \
+            -v /tmp/grafana_backup_{{ incident_id }}:/backup \
+            quay.io/openstack.kolla/grafana:2025.1-ubuntu-noble \
+            tar xzf /backup/grafana_data.tar.gz -C /
+        fi
+      ignore_errors: yes
+      
+    - name: "[ALERT] Recovery failed"
+      debug:
+        msg: |
+          ❌ GRAFANA RECOVERY FAILED
+          
+          Manual intervention required:
+          
+          1. Check container logs:
+             docker logs grafana
+          
+          2. Try Kolla reconfigure:
+             kolla-ansible reconfigure -t grafana
+          
+          3. Check system resources:
+             free -h
+             df -h
+          
+          4. Review backup:
+             ls -lh /tmp/grafana_backup_{{ incident_id }}/
+          
+          5. As last resort, remove and redeploy:
+             docker stop grafana
+             docker rm grafana
+             kolla-ansible deploy -t grafana
+          
+    - fail:
+        msg: "Grafana recovery failed - check /tmp/autosphere_incident_{{ incident_id }}_grafana.log"

@@ -1,0 +1,125 @@
+---
+# AutoSphere Playbook: RabbitMQ Cluster Rolling Restart
+# Purpose: Fix RabbitMQ issues (split-brain, memory pressure, queue overflow)
+# Risk: CRITICAL - This is a ROOT CAUSE service affecting Nova, Neutron, Cinder
+# Estimated Time: 15 minutes
+# Last Updated: 2025
+
+- name: RabbitMQ Cluster Rolling Restart
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    rabbitmq_container: "{{ rabbitmq_container_name | default('rabbitmq') }}"
+    wait_time: 60
+    health_check_retries: 10
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify RabbitMQ container exists"
+      shell: docker ps -a --filter "name={{ rabbitmq_container }}" --format "{%raw%}{{.Names}}{%endraw%}"
+      register: container_check
+      failed_when: container_check.stdout == ""
+      
+    - name: "[PRE-CHECK] Get cluster status before restart"
+      shell: docker exec {{ rabbitmq_container }} rabbitmqctl cluster_status --formatter json
+      register: cluster_before
+      ignore_errors: yes
+      
+    - name: "[PRE-CHECK] Check queue depth"
+      shell: docker exec {{ rabbitmq_container }} rabbitmqctl list_queues name messages --formatter json
+      register: queue_depth
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Save current RabbitMQ configuration"
+      shell: |
+        docker exec {{ rabbitmq_container }} cat /etc/rabbitmq/rabbitmq.conf > /tmp/rabbitmq.conf.backup.{{ incident_id }}
+        docker exec {{ rabbitmq_container }} rabbitmqctl export_definitions /tmp/definitions.{{ incident_id }}.json
+      ignore_errors: yes
+      
+    - name: "[EXECUTE] Rolling restart RabbitMQ nodes"
+      block:
+        - name: Get RabbitMQ cluster nodes
+          shell: docker exec {{ rabbitmq_container }} rabbitmqctl cluster_status --formatter json | jq -r '.running_nodes[]'
+          register: cluster_nodes
+          ignore_errors: yes
+          
+        - name: Restart each node with wait
+          shell: |
+            docker restart {{ rabbitmq_container }}
+            sleep {{ wait_time }}
+          when: cluster_nodes.rc == 0
+          
+        - name: Wait for RabbitMQ to be ready
+          shell: docker exec {{ rabbitmq_container }} rabbitmqctl await_startup
+          register: startup_check
+          retries: "{{ health_check_retries }}"
+          delay: 10
+          until: startup_check.rc == 0
+          
+    - name: "[VERIFY] Check cluster health"
+      shell: docker exec {{ rabbitmq_container }} rabbitmqctl cluster_status --formatter json
+      register: cluster_after
+      retries: 5
+      delay: 10
+      until: cluster_after.rc == 0
+      
+    - name: "[VERIFY] Verify all nodes running"
+      shell: docker exec {{ rabbitmq_container }} rabbitmqctl node_health_check
+      register: health_check
+      failed_when: health_check.rc != 0
+      
+    - name: "[VERIFY] Check connections restored"
+      shell: docker exec {{ rabbitmq_container }} rabbitmqctl list_connections --formatter json
+      register: connections_check
+      
+    - name: "[POST-CHECK] Verify OpenStack services reconnected"
+      shell: |
+        for service in nova-api nova-conductor nova-scheduler neutron-server cinder-api; do
+          docker logs --tail 50 $service 2>&1 | grep -i "AMQP" || true
+        done
+      register: service_logs
+      
+    - name: "[REPORT] Generate incident report"
+      copy:
+        content: |
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Action: RabbitMQ Cluster Restart
+          
+          PRE-STATE:
+          {{ cluster_before.stdout | default('N/A') }}
+          
+          POST-STATE:
+          {{ cluster_after.stdout }}
+          
+          Health Check: {{ health_check.stdout }}
+          Connections: {{ connections_check.stdout | from_json | length }} active
+          
+          OpenStack Service Logs:
+          {{ service_logs.stdout }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_rabbitmq.log"
+        
+    - name: "[ALERT] Notify completion"
+      debug:
+        msg: |
+          ✅ RabbitMQ cluster restart completed
+          Incident: {{ incident_id }}
+          Time: {{ ansible_date_time.time }}
+          Health: {{ 'HEALTHY' if health_check.rc == 0 else 'DEGRADED' }}
+          
+  rescue:
+    - name: "[ROLLBACK] Restore configuration"
+      shell: |
+        docker cp /tmp/rabbitmq.conf.backup.{{ incident_id }} {{ rabbitmq_container }}:/etc/rabbitmq/rabbitmq.conf
+        docker restart {{ rabbitmq_container }}
+      ignore_errors: yes
+      
+    - name: "[ALERT] Report failure"
+      debug:
+        msg: "❌ RabbitMQ restart failed - Manual intervention required"
+      
+    - fail:
+        msg: "RabbitMQ restart failed - check logs in /tmp/autosphere_incident_{{ incident_id }}_rabbitmq.log"

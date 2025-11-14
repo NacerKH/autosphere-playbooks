@@ -1,0 +1,134 @@
+---
+# AutoSphere Playbook: Cinder Volume Service Recovery
+# Purpose: Fix Cinder volume attachment failures and iSCSI issues
+# Risk: MEDIUM - Volume operations will be interrupted
+# Estimated Time: 15 minutes
+# Last Updated: 2025
+
+- name: Cinder Volume Service Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    cinder_services: ["cinder-api", "cinder-scheduler", "cinder-volume", "cinder-backup"]
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify Cinder containers"
+      shell: docker ps --filter "name=cinder" --format "{%raw%}{{.Names}}{%endraw%}"
+      register: cinder_containers
+      
+    - name: "[DIAGNOSIS] Check volume service status"
+      shell: docker exec cinder_api cinder-manage service list
+      register: volume_services
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Check for stuck volumes"
+      shell: |
+        docker exec cinder_api openstack volume list --status error -f json
+        docker exec cinder_api openstack volume list --status attaching -f json
+      register: stuck_volumes
+      
+    - name: "[DIAGNOSIS] Check iSCSI target status"
+      shell: |
+        docker exec cinder_volume tgtadm --mode target --op show || true
+      register: iscsi_targets
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Save Cinder state"
+      shell: |
+        docker exec cinder_api cinder-manage service list > /tmp/cinder_services_{{ incident_id }}.txt
+        docker logs --tail 500 cinder_volume > /tmp/cinder_volume_{{ incident_id }}.log 2>&1
+        
+    - name: "[EXECUTE] Clear volume locks if needed"
+      shell: |
+        # Reset stuck volume states
+        for vol_id in $(echo '{{ stuck_volumes.stdout }}' | jq -r '.[].ID' 2>/dev/null); do
+          docker exec cinder_api cinder reset-state --state available $vol_id || true
+        done
+      when: stuck_volumes.stdout | length > 2
+      
+    - name: "[EXECUTE] Restart Cinder services in order"
+      shell: |
+        # Proper restart sequence
+        docker restart cinder-scheduler
+        sleep 10
+        docker restart cinder-api
+        sleep 10
+        docker restart cinder-volume
+        sleep 10
+        docker restart cinder-backup || true
+        
+    - name: "[VERIFY] Wait for services ready"
+      wait_for:
+        timeout: 90
+        
+    - name: "[VERIFY] Check service health"
+      shell: docker exec cinder_api cinder-manage service list
+      register: services_after
+      retries: 10
+      delay: 6
+      until: services_after.rc == 0
+      
+    - name: "[VERIFY] Test volume API"
+      shell: |
+        docker exec cinder_api openstack volume service list -f json
+      register: api_test
+      
+    - name: "[VERIFY] Check iSCSI targets restored"
+      shell: |
+        docker exec cinder_volume tgtadm --mode target --op show
+      register: iscsi_after
+      ignore_errors: yes
+      
+    - name: "[POST-CHECK] Verify no error volumes"
+      shell: |
+        error_count=$(docker exec cinder_api openstack volume list --status error -f json | jq 'length')
+        echo "Error volumes: $error_count"
+        if [ "$error_count" -gt 0 ]; then
+          docker exec cinder_api openstack volume list --status error
+        fi
+      register: error_volumes
+      
+    - name: "[REPORT] Generate report"
+      copy:
+        content: |
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Action: Cinder Volume Recovery
+          
+          BEFORE:
+          {{ volume_services.stdout | default('N/A') }}
+          
+          STUCK VOLUMES:
+          {{ stuck_volumes.stdout }}
+          
+          AFTER:
+          {{ services_after.stdout }}
+          
+          API Health: {{ 'OK' if api_test.rc == 0 else 'DEGRADED' }}
+          iSCSI Targets: {{ 'OK' if iscsi_after.rc == 0 else 'CHECK NEEDED' }}
+          
+          ERROR VOLUMES:
+          {{ error_volumes.stdout }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_cinder.log"
+        
+    - name: "[ALERT] Success"
+      debug:
+        msg: |
+          ✅ Cinder services recovered
+          Incident: {{ incident_id }}
+          All services: UP
+          
+  rescue:
+    - name: "[ROLLBACK] Emergency restart"
+      shell: |
+        for service in {{ cinder_services | join(' ') }}; do
+          docker restart $service || true
+        done
+      ignore_errors: yes
+      
+    - fail:
+        msg: "Cinder recovery failed - check /tmp/autosphere_incident_{{ incident_id }}_cinder.log"

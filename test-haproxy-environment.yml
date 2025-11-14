@@ -1,0 +1,209 @@
+---
+# HAProxy Environment Validation Playbook
+# Verifies prerequisites before running remediation playbooks
+# Risk: None (read-only checks)
+# Estimated Time: 30 seconds
+
+- name: Validate HAProxy Environment
+  hosts: "{{ target_host | default('control') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    haproxy_container: haproxy
+    required_tools:
+      - docker
+      - socat
+      - openssl
+      - curl
+
+  tasks:
+    - name: "Check 1: Verify Docker is installed"
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: "Check 2: Verify HAProxy container exists"
+      docker_container_info:
+        name: "{{ haproxy_container }}"
+      register: haproxy_status
+      failed_when: not haproxy_status.exists
+
+    - name: "Check 3: Verify HAProxy container is running"
+      assert:
+        that:
+          - haproxy_status.container.State.Running
+        fail_msg: "HAProxy container is not running"
+        success_msg: "HAProxy container is running"
+
+    - name: "Check 4: Verify HAProxy process is alive"
+      shell: |
+        docker exec {{ haproxy_container }} pgrep -x haproxy
+      register: haproxy_process
+      changed_when: false
+
+    - name: "Check 5: Verify socat is available (for admin socket)"
+      shell: |
+        docker exec {{ haproxy_container }} which socat
+      register: socat_check
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 6: Test HAProxy admin socket"
+      shell: |
+        echo "show info" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock
+      register: admin_socket_test
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 7: Get HAProxy configuration location"
+      shell: |
+        docker exec {{ haproxy_container }} cat /etc/haproxy/haproxy.cfg | head -5
+      register: haproxy_config
+      changed_when: false
+
+    - name: "Check 8: Verify SSL certificate exists"
+      shell: |
+        docker exec {{ haproxy_container }} test -f /var/lib/kolla/config_files/src/haproxy.pem && echo "exists" || echo "missing"
+      register: ssl_cert_check
+      changed_when: false
+
+    - name: "Check 9: Get certificate expiry"
+      shell: |
+        docker exec {{ haproxy_container }} openssl x509 -in /var/lib/kolla/config_files/src/haproxy.pem -noout -enddate
+      register: cert_expiry
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 10: Count HAProxy backends"
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND" | wc -l
+      register: backend_count
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 11: List backend names"
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND" | cut -d',' -f1
+      register: backend_names
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 12: Test stats page accessibility"
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:1984"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: stats_page
+      failed_when: false
+
+    - name: "Check 13: Verify API VIP reachability"
+      shell: |
+        curl -sk -o /dev/null -w "%{http_code}" https://{{ internal_vip }}:5000/v3
+      register: vip_test
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 14: Get current connection count"
+      shell: |
+        docker exec {{ haproxy_container }} ss -tan | grep -c ESTABLISHED || true
+      register: connection_count
+      changed_when: false
+
+    - name: "Check 15: Check for DOWN backends"
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND" | grep -c "DOWN" || true
+      register: down_backends
+      changed_when: false
+
+    - name: "Check 16: Verify Ansible collections"
+      shell: |
+        ansible-galaxy collection list | grep -E "(community.docker|ansible.posix)" || echo "missing"
+      register: ansible_collections
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 17: Verify Python Docker module"
+      shell: |
+        python3 -c "import docker; print(docker.__version__)"
+      register: python_docker
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "Check 18: Test sudo access"
+      command: sudo -n true
+      changed_when: false
+      failed_when: false
+
+  post_tasks:
+    - name: Generate validation report
+      set_fact:
+        validation_report: |
+          ========================================
+          HAProxy Environment Validation Report
+          ========================================
+          Host: {{ inventory_hostname }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          
+          ✅ PASSED CHECKS:
+          - Docker version: {{ docker_version.stdout }}
+          - HAProxy container: Running
+          - HAProxy process: PID {{ haproxy_process.stdout }}
+          - Admin socket: {{ 'Working' if admin_socket_test.rc == 0 else 'Failed' }}
+          - SSL certificate: {{ ssl_cert_check.stdout }}
+          - Certificate expiry: {{ cert_expiry.stdout if cert_expiry.rc == 0 else 'N/A' }}
+          - Backend count: {{ backend_count.stdout if backend_count.rc == 0 else 'N/A' }}
+          - DOWN backends: {{ down_backends.stdout }}
+          - Active connections: {{ connection_count.stdout }}
+          - Stats page: {{ 'Accessible' if stats_page.status == 200 else 'Inaccessible' }}
+          - API VIP ({{ internal_vip }}): HTTP {{ vip_test.stdout if vip_test.rc == 0 else 'Failed' }}
+          
+          📋 BACKENDS DETECTED:
+          {{ backend_names.stdout_lines | join('\n          ') if backend_names.rc == 0 else 'N/A' }}
+          
+          🔧 LOCAL ENVIRONMENT:
+          - Ansible collections: {{ 'OK' if 'community.docker' in ansible_collections.stdout else 'MISSING community.docker' }}
+          - Python docker module: {{ python_docker.stdout if python_docker.rc == 0 else 'NOT INSTALLED' }}
+          - Sudo access: {{ 'Granted' if sudo_access.rc == 0 else 'Denied' }}
+          
+          {% if socat_check.rc != 0 %}
+          ⚠️  WARNINGS:
+          - socat not found in HAProxy container (required for admin socket)
+            Fix: docker exec {{ haproxy_container }} apt-get update && apt-get install -y socat
+          {% endif %}
+          
+          {% if down_backends.stdout | int > 0 %}
+          ⚠️  ISSUES DETECTED:
+          - {{ down_backends.stdout }} backend(s) are DOWN
+            Run: ansible-playbook diagnose-haproxy.yml -e "target_host={{ inventory_hostname }}"
+          {% endif %}
+          
+          ✅ READY FOR REMEDIATION PLAYBOOKS: {{ 'Yes' if (haproxy_process.rc == 0 and admin_socket_test.rc == 0) else 'No - Fix issues above' }}
+          ========================================
+
+    - name: Display validation report
+      debug:
+        msg: "{{ validation_report.split('\n') }}"
+
+    - name: Save validation report
+      copy:
+        content: "{{ validation_report }}"
+        dest: "/tmp/haproxy_validation_{{ ansible_date_time.epoch }}.txt"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Final verdict
+      debug:
+        msg: |
+          Validation complete. Report saved to:
+          /tmp/haproxy_validation_{{ ansible_date_time.epoch }}.txt
+          
+          Ready for production use: {{ 'YES ✅' if (haproxy_process.rc == 0 and admin_socket_test.rc == 0 and down_backends.stdout | int == 0) else 'NO ⚠️ - Review warnings above' }}
+
+# Usage:
+# ansible-playbook test-haproxy-environment.yml
+# ansible-playbook test-haproxy-environment.yml -e "target_host=control01"
+# ansible-playbook test-haproxy-environment.yml -i inventory.yml

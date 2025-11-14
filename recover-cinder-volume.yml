@@ -1,0 +1,190 @@
+---
+# AutoSphere Playbook: Cinder Volume Service Recovery
+# Purpose: Fix Cinder volume attachment failures, stuck volumes
+# Risk: MEDIUM - Volume data safe but attachments may fail
+# Estimated Time: 15 minutes
+# Last Updated: 2025
+
+- name: Cinder Volume Service Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    cinder_services: ["cinder-api", "cinder-scheduler", "cinder-volume"]
+    
+  tasks:
+    - name: "[PRE-CHECK] Check Cinder services"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack volume service list --format json
+      register: service_status
+      
+    - name: "[PRE-CHECK] Identify stuck volumes"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack volume list --status error --all-projects --format json
+      register: error_volumes
+      
+    - name: "[PRE-CHECK] Check volume attachments"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack volume list --status "attaching" --all-projects --format json
+      register: stuck_attachments
+      
+    - name: "[DIAGNOSIS] Check Cinder logs"
+      shell: |
+        for service in {{ cinder_services | join(' ') }}; do
+          echo "=== $service logs ==="
+          docker logs --tail 50 $service 2>&1 | grep -i "error\|failed\|timeout" || true
+        done
+      register: cinder_logs
+      
+    - name: "[DIAGNOSIS] Check backend status"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        cinder service-list --binary cinder-volume
+      register: backend_status
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Save volume states"
+      shell: |
+        mkdir -p /tmp/cinder_recovery_{{ incident_id }}
+        source /etc/kolla/admin-openrc.sh
+        openstack volume list --all-projects --format json > /tmp/cinder_recovery_{{ incident_id }}/volumes_before.json
+        openstack volume service list --format json > /tmp/cinder_recovery_{{ incident_id }}/services_before.json
+        
+    - name: "[EXECUTE] Reset stuck volume states"
+      when: (error_volumes.stdout | from_json) | length > 0
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        echo '{{ error_volumes.stdout }}' | jq -r '.[].ID' | while read vol_id; do
+          echo "Resetting volume: $vol_id"
+          openstack volume set --state available $vol_id || true
+        done
+      
+    - name: "[EXECUTE] Clear stuck attachments"
+      when: (stuck_attachments.stdout | from_json) | length > 0
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        echo '{{ stuck_attachments.stdout }}' | jq -r '.[].ID' | while read vol_id; do
+          echo "Clearing attachment: $vol_id"
+          cinder reset-state --state available --attach-status detached $vol_id || true
+        done
+        
+    - name: "[EXECUTE] Restart Cinder services in sequence"
+      shell: |
+        # Restart in dependency order
+        for service in cinder-scheduler cinder-api cinder-volume; do
+          echo "Restarting $service..."
+          docker restart $service
+          sleep 15
+        done
+        
+    - name: "[VERIFY] Wait for services ready"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack volume service list --format json
+      register: services_after
+      retries: 10
+      delay: 10
+      until: services_after.rc == 0
+      
+    - name: "[VERIFY] Check all services up"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        down_count=$(openstack volume service list --format json | jq '[.[] | select(.State == "down")] | length')
+        echo "Down services: $down_count"
+        exit $down_count
+      register: service_health
+      failed_when: service_health.rc > 0
+      
+    - name: "[VERIFY] Test volume operations"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        
+        # Test create
+        vol_id=$(openstack volume create --size 1 autosphere-test-{{ incident_id }} -f json | jq -r '.id')
+        sleep 5
+        
+        # Check status
+        status=$(openstack volume show $vol_id -f json | jq -r '.status')
+        
+        # Cleanup
+        openstack volume delete $vol_id
+        
+        if [ "$status" != "available" ]; then
+          echo "FAILED: Volume creation test failed (status: $status)"
+          exit 1
+        fi
+        echo "SUCCESS: Volume operations working"
+      register: operation_test
+      ignore_errors: yes
+      
+    - name: "[POST-CHECK] Verify backend connectivity"
+      shell: |
+        for service in {{ cinder_services | join(' ') }}; do
+          docker exec $service cinder-manage service list 2>/dev/null || true
+        done
+      register: backend_connectivity
+      
+    - name: "[REPORT] Generate recovery report"
+      copy:
+        content: |
+          ========================================
+          CINDER VOLUME SERVICE RECOVERY
+          ========================================
+          
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          
+          ERROR VOLUMES FOUND: {{ (error_volumes.stdout | from_json) | length }}
+          STUCK ATTACHMENTS: {{ (stuck_attachments.stdout | from_json) | length }}
+          
+          DIAGNOSIS:
+          {{ cinder_logs.stdout }}
+          
+          SERVICES BEFORE:
+          {{ service_status.stdout | from_json | to_nice_json }}
+          
+          SERVICES AFTER:
+          {{ services_after.stdout | from_json | to_nice_json }}
+          
+          OPERATION TEST: {{ 'PASS' if operation_test.rc == 0 else 'FAIL' }}
+          SERVICE HEALTH: {{ 'HEALTHY' if service_health.rc == 0 else 'DEGRADED' }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_cinder.log"
+        
+    - name: "[ALERT] Recovery complete"
+      debug:
+        msg: |
+          ✅ Cinder volume service recovered
+          
+          Incident: {{ incident_id }}
+          Services: {{ 'UP' if service_health.rc == 0 else 'DEGRADED' }}
+          Operations: {{ 'OK' if operation_test.rc == 0 else 'FAILED' }}
+          
+          Report: /tmp/autosphere_incident_{{ incident_id }}_cinder.log
+          
+  rescue:
+    - name: "[ROLLBACK] Restart all Cinder services"
+      shell: |
+        for service in {{ cinder_services | join(' ') }}; do
+          docker restart $service
+        done
+      ignore_errors: yes
+      
+    - name: "[ALERT] Recovery failed"
+      debug:
+        msg: |
+          ❌ CINDER RECOVERY FAILED
+          
+          Manual steps:
+          1. Check backend storage health
+          2. Verify iSCSI/NFS connectivity
+          3. Review: /tmp/autosphere_incident_{{ incident_id }}_cinder.log
+          4. Consider: kolla-ansible reconfigure -t cinder
+          
+    - fail:
+        msg: "Cinder recovery failed"

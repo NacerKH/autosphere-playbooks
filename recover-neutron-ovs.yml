@@ -1,0 +1,141 @@
+---
+# AutoSphere Playbook: Neutron OVS Bridge Recovery
+# Purpose: Fix OpenvSwitch bridge misconfigurations and network outages
+# Risk: HIGH - Network disruption during execution
+# Estimated Time: 20 minutes
+# Last Updated: 2025
+
+- name: Neutron OpenvSwitch Bridge Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    neutron_ovs_container: "neutron_openvswitch_agent"
+    expected_bridges: ["br-int", "br-ex", "br-tun"]
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify OVS container running"
+      shell: docker ps --filter "name={{ neutron_ovs_container }}" --format "{%raw%}{{.Names}}{%endraw%}"
+      register: container_check
+      failed_when: container_check.stdout == ""
+      
+    - name: "[PRE-CHECK] Check current bridge status"
+      shell: docker exec {{ neutron_ovs_container }} ovs-vsctl show
+      register: ovs_before
+      
+    - name: "[DIAGNOSIS] Identify missing bridges"
+      shell: |
+        for bridge in {{ expected_bridges | join(' ') }}; do
+          docker exec {{ neutron_ovs_container }} ovs-vsctl br-exists $bridge || echo "MISSING: $bridge"
+        done
+      register: missing_bridges
+      
+    - name: "[DIAGNOSIS] Check OVS agent logs"
+      shell: docker logs --tail 100 {{ neutron_ovs_container }} 2>&1 | grep -i "error\|failed\|bridge"
+      register: agent_logs
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Save OVS configuration"
+      shell: |
+        docker exec {{ neutron_ovs_container }} ovs-vsctl show > /tmp/ovs_config_{{ incident_id }}.txt
+        docker exec {{ neutron_ovs_container }} ovs-vsctl list-br > /tmp/ovs_bridges_{{ incident_id }}.txt
+      
+    - name: "[EXECUTE] Clean up stale OVS configuration"
+      block:
+        - name: Run neutron-ovs-cleanup
+          shell: docker exec {{ neutron_ovs_container }} neutron-ovs-cleanup --config-file /etc/neutron/neutron.conf
+          ignore_errors: yes
+          
+        - name: Remove stale bridge configurations
+          shell: |
+            docker exec {{ neutron_ovs_container }} bash -c '
+              for port in $(ovs-vsctl list-ports br-int | grep "qvo\|qvb"); do
+                ovs-vsctl --if-exists del-port br-int $port
+              done
+            '
+          ignore_errors: yes
+          
+    - name: "[EXECUTE] Restart OVS agent"
+      shell: docker restart {{ neutron_ovs_container }}
+      
+    - name: "[VERIFY] Wait for agent startup"
+      wait_for:
+        timeout: 60
+        
+    - name: "[VERIFY] Check bridges recreated"
+      shell: docker exec {{ neutron_ovs_container }} ovs-vsctl show
+      register: ovs_after
+      retries: 5
+      delay: 10
+      until: ovs_after.rc == 0
+      
+    - name: "[VERIFY] Confirm all expected bridges exist"
+      shell: |
+        for bridge in {{ expected_bridges | join(' ') }}; do
+          docker exec {{ neutron_ovs_container }} ovs-vsctl br-exists $bridge || exit 1
+        done
+      register: bridge_check
+      failed_when: bridge_check.rc != 0
+      
+    - name: "[VERIFY] Check OVS agent status"
+      shell: docker exec neutron_server neutron agent-list --agent-type "Open vSwitch agent"
+      register: agent_status
+      ignore_errors: yes
+      
+    - name: "[POST-CHECK] Test network connectivity"
+      shell: |
+        # Ping test through OVS bridges
+        docker exec {{ neutron_ovs_container }} bash -c 'ping -c 3 8.8.8.8' || true
+      register: connectivity_test
+      
+    - name: "[REPORT] Generate report"
+      copy:
+        content: |
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Action: Neutron OVS Bridge Recovery
+          
+          DIAGNOSIS:
+          Missing Bridges: {{ missing_bridges.stdout }}
+          Agent Errors: {{ agent_logs.stdout }}
+          
+          BEFORE:
+          {{ ovs_before.stdout }}
+          
+          AFTER:
+          {{ ovs_after.stdout }}
+          
+          Bridge Check: {{ 'PASS' if bridge_check.rc == 0 else 'FAIL' }}
+          Agent Status: {{ agent_status.stdout }}
+          Connectivity: {{ 'OK' if connectivity_test.rc == 0 else 'DEGRADED' }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_ovs.log"
+        
+    - name: "[ALERT] Success"
+      debug:
+        msg: |
+          ✅ OVS bridges recovered
+          Incident: {{ incident_id }}
+          All bridges: {{ bridge_check.rc == 0 }}
+          
+  rescue:
+    - name: "[ROLLBACK] Restore OVS config"
+      shell: |
+        # Attempt to restore from backup
+        docker restart {{ neutron_ovs_container }}
+      ignore_errors: yes
+      
+    - name: "[ALERT] Manual intervention required"
+      debug:
+        msg: |
+          ❌ OVS recovery failed
+          Check: /tmp/autosphere_incident_{{ incident_id }}_ovs.log
+          Manual steps:
+          1. kolla-ansible reconfigure -t neutron
+          2. Verify physical network interfaces
+          3. Check OpenStack network configuration
+          
+    - fail:
+        msg: "OVS bridge recovery failed"

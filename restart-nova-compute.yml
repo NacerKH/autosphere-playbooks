@@ -1,0 +1,165 @@
+---
+# AutoSphere Playbook: Restart Nova Compute Service
+# Purpose: Restart Nova compute on specific hypervisor node
+# Risk: HIGH - May affect running VMs if not careful
+# Estimated Time: 30 minutes
+
+- name: Restart Nova Compute Service
+  hosts: "{{ compute_node | default('compute') }}"
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    nova_compute_container: "nova_compute"
+    evacuate_vms: "{{ evacuate_vms | default(false) }}"
+    force_restart: "{{ force | default(false) }}"
+    
+  tasks:
+    - name: Display incident information
+      debug:
+        msg: 
+          - "Restarting Nova Compute for incident {{ incident_id | default('N/A') }}"
+          - "Target node: {{ ansible_hostname }}"
+          - "Evacuate VMs: {{ evacuate_vms }}"
+          
+    - name: Check if Nova compute container exists
+      command: docker ps --filter name={{ nova_compute_container }} --format "{{ '{{' }}.Names{{ '}}' }}"
+      register: nova_check
+      changed_when: false
+      
+    - name: Fail if Nova compute not found
+      fail:
+        msg: "Nova compute container not found on {{ ansible_hostname }}"
+      when: nova_check.stdout == ""
+      
+    - name: Get compute service status
+      shell: |
+        docker exec nova_compute openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f json
+      register: compute_status
+      changed_when: false
+      delegate_to: "{{ groups['control'][0] }}"
+      
+    - name: Display current compute service status
+      debug:
+        var: compute_status.stdout
+        
+    - name: List running VMs on this compute node
+      shell: |
+        docker exec nova_compute openstack server list --host {{ ansible_hostname }} --all-projects -f json
+      register: running_vms
+      changed_when: false
+      delegate_to: "{{ groups['control'][0] }}"
+      
+    - name: Display running VMs
+      debug:
+        var: running_vms.stdout
+        
+    - name: Count running VMs
+      set_fact:
+        vm_count: "{{ (running_vms.stdout | from_json) | length }}"
+        
+    - name: Check if VMs exist and force not set
+      fail:
+        msg: "{{ vm_count }} VMs running on node. Set evacuate_vms=true or force=true to proceed"
+      when: 
+        - vm_count | int > 0
+        - not evacuate_vms | bool
+        - not force_restart | bool
+        
+    - name: Evacuate VMs if requested
+      block:
+        - name: Disable compute service
+          shell: |
+            docker exec nova_compute openstack compute service set {{ ansible_hostname }} nova-compute --disable --disable-reason "AutoSphere maintenance"
+          delegate_to: "{{ groups['control'][0] }}"
+          
+        - name: Get list of VM IDs to evacuate
+          shell: |
+            docker exec nova_compute openstack server list --host {{ ansible_hostname }} --all-projects -f value -c ID
+          register: vm_ids
+          delegate_to: "{{ groups['control'][0] }}"
+          
+        - name: Live migrate each VM
+          shell: |
+            docker exec nova_compute openstack server migrate {{ item }} --live-migration --wait
+          loop: "{{ vm_ids.stdout_lines }}"
+          when: vm_ids.stdout_lines | length > 0
+          delegate_to: "{{ groups['control'][0] }}"
+          ignore_errors: yes
+          
+        - name: Wait for migrations to complete
+          pause:
+            seconds: 30
+          when: vm_ids.stdout_lines | length > 0
+          
+      when: evacuate_vms | bool
+      
+    - name: Stop Nova compute service
+      shell: |
+        docker stop {{ nova_compute_container }}
+      register: stop_result
+      
+    - name: Wait for graceful stop
+      pause:
+        seconds: 10
+        
+    - name: Clear Nova compute cache
+      shell: |
+        docker exec {{ nova_compute_container }} rm -rf /var/lib/nova/instances/_base/*
+      ignore_errors: yes
+      
+    - name: Start Nova compute service
+      shell: |
+        docker start {{ nova_compute_container }}
+      register: start_result
+      
+    - name: Wait for service to start
+      wait_for:
+        timeout: 60
+        
+    - name: Verify container is running
+      command: docker ps --filter name={{ nova_compute_container }} --filter status=running --format "{{ '{{' }}.Names{{ '}}' }}"
+      register: verify_running
+      until: verify_running.stdout != ""
+      retries: 6
+      delay: 10
+      
+    - name: Re-enable compute service
+      shell: |
+        docker exec nova_compute openstack compute service set {{ ansible_hostname }} nova-compute --enable
+      delegate_to: "{{ groups['control'][0] }}"
+      when: evacuate_vms | bool
+      
+    - name: Wait for compute service to report up
+      shell: |
+        docker exec nova_compute openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f value -c State
+      register: service_state
+      until: service_state.stdout == "up"
+      retries: 12
+      delay: 5
+      delegate_to: "{{ groups['control'][0] }}"
+      
+    - name: Get final compute service status
+      shell: |
+        docker exec nova_compute openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f json
+      register: final_status
+      changed_when: false
+      delegate_to: "{{ groups['control'][0] }}"
+      
+    - name: Check for errors in Nova compute logs
+      shell: |
+        docker logs --tail 50 {{ nova_compute_container }} 2>&1 | grep -i error | tail -10
+      register: error_logs
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Summary report
+      debug:
+        msg:
+          - "=== Nova Compute Restart Summary ==="
+          - "Incident ID: {{ incident_id | default('N/A') }}"
+          - "Compute Node: {{ ansible_hostname }}"
+          - "VMs Evacuated: {{ vm_count if evacuate_vms else '0' }}"
+          - "Service State: {{ service_state.stdout }}"
+          - "Container Status: {{ verify_running.stdout }}"
+          - "Restart Time: {{ ansible_date_time.iso8601 }}"

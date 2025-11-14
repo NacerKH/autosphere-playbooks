@@ -1,0 +1,74 @@
+---
+# Ansible Inventory for Kolla-Ansible OpenStack Control Nodes
+# Update hostnames and IPs to match your deployment
+
+[control]
+control01 ansible_host=10.0.0.11 ansible_user=root
+control02 ansible_host=10.0.0.12 ansible_user=root
+control03 ansible_host=10.0.0.13 ansible_user=root
+
+[control:vars]
+ansible_connection=ssh
+ansible_python_interpreter=/usr/bin/python3
+internal_vip=10.0.0.100
+external_vip=192.168.1.100
+keepalived_vip=10.0.0.100
+kolla_version=2025.1
+
+# HAProxy-specific variables
+haproxy_container=haproxy
+haproxy_stats_port=1984
+haproxy_admin_socket=/run/haproxy/admin.sock
+
+# OpenStack service endpoints
+keystone_port=5000
+nova_api_port=8774
+neutron_server_port=9696
+glance_api_port=9292
+cinder_api_port=8776
+horizon_port=80
+
+# SSL/TLS configuration
+ssl_cert_path=/etc/kolla/certificates/haproxy.pem
+ssl_internal_cert_path=/etc/kolla/certificates/haproxy-internal.pem
+
+[compute]
+compute01 ansible_host=10.0.0.21 ansible_user=root
+compute02 ansible_host=10.0.0.22 ansible_user=root
+
+[storage]
+storage01 ansible_host=10.0.0.31 ansible_user=root
+
+[network]
+network01 ansible_host=10.0.0.41 ansible_user=root
+
+[monitoring]
+monitoring01 ansible_host=10.0.0.51 ansible_user=root
+
+# Group definitions for different node types
+[openstack:children]
+control
+compute
+storage
+network
+
+[all:vars]
+ansible_connection=ssh
+ansible_user=root
+ansible_python_interpreter=/usr/bin/python3
+
+# Docker configuration
+docker_runtime=docker
+container_engine=docker
+
+# Logging
+log_directory=/var/log/autosphere
+backup_directory=/etc/kolla/backups
+
+# AWX/Tower integration (if using AutoSphere)
+awx_api_url=https://awx.example.com
+awx_verify_ssl=false
+
+# Notification endpoints
+redmine_api_url=http://redmine.example.com
+slack_webhook_url=https://hooks.slack.com/services/XXX/YYY/ZZZ

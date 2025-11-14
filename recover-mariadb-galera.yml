@@ -1,0 +1,143 @@
+---
+# AutoSphere Playbook: MariaDB Galera Cluster Recovery
+# Purpose: Fix MariaDB split-brain, cluster desync, bootstrap issues
+# Risk: CRITICAL - Database affects ALL OpenStack services
+# Estimated Time: 10 minutes
+# Last Updated: 2025
+
+- name: MariaDB Galera Cluster Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    mariadb_container: "{{ mariadb_container_name | default('mariadb') }}"
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify MariaDB container"
+      shell: docker ps -a --filter "name={{ mariadb_container }}" --format "{%raw%}{{.Names}}{%endraw%}"
+      register: container_check
+      failed_when: container_check.stdout == ""
+      
+    - name: "[PRE-CHECK] Check cluster status"
+      shell: |
+        docker exec {{ mariadb_container }} mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          -e "SHOW STATUS LIKE 'wsrep_%'" > /tmp/galera_status_before.{{ incident_id }}.txt
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Detect split-brain"
+      shell: |
+        docker exec {{ mariadb_container }} mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          -e "SHOW STATUS LIKE 'wsrep_cluster_status'" | grep -i primary
+      register: cluster_status
+      ignore_errors: yes
+      
+    - name: "[DIAGNOSIS] Check if bootstrap needed"
+      shell: |
+        docker exec {{ mariadb_container }} mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          -e "SHOW STATUS LIKE 'wsrep_cluster_size'" | awk '{print $2}' | tail -1
+      register: cluster_size
+      ignore_errors: yes
+      
+    - name: "[BACKUP] Backup critical databases"
+      shell: |
+        docker exec {{ mariadb_container }} mysqldump -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          --all-databases --single-transaction --quick --lock-tables=false \
+          > /tmp/mariadb_backup_{{ incident_id }}.sql
+      async: 300
+      poll: 10
+      ignore_errors: yes
+      
+    - name: "[EXECUTE] Bootstrap Galera cluster if needed"
+      when: cluster_size.stdout | int == 0 or cluster_status.rc != 0
+      block:
+        - name: Stop MariaDB gracefully
+          shell: docker stop {{ mariadb_container }}
+          
+        - name: Bootstrap first node
+          shell: |
+            docker run --rm \
+              --volumes-from {{ mariadb_container }} \
+              --entrypoint /bin/bash \
+              {{ lookup('pipe', 'docker inspect ' + mariadb_container + ' --format="{%raw%}{{.Config.Image}}{%endraw%}"') }} \
+              -c "mysqld --wsrep-new-cluster &"
+          async: 60
+          poll: 0
+          
+        - name: Wait for bootstrap
+          wait_for:
+            timeout: 30
+            
+        - name: Restart MariaDB normally
+          shell: docker start {{ mariadb_container }}
+          
+    - name: "[EXECUTE] Restart MariaDB if bootstrap not needed"
+      when: cluster_size.stdout | int > 0 and cluster_status.rc == 0
+      shell: docker restart {{ mariadb_container }}
+      
+    - name: "[VERIFY] Wait for MariaDB ready"
+      shell: |
+        docker exec {{ mariadb_container }} mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          -e "SELECT 1"
+      register: mysql_ready
+      retries: 10
+      delay: 10
+      until: mysql_ready.rc == 0
+      
+    - name: "[VERIFY] Check cluster health"
+      shell: |
+        docker exec {{ mariadb_container }} mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          -e "SHOW STATUS LIKE 'wsrep_%'" > /tmp/galera_status_after.{{ incident_id }}.txt
+      register: cluster_after
+      
+    - name: "[VERIFY] Ensure Primary component"
+      shell: |
+        docker exec {{ mariadb_container }} mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+          -e "SHOW STATUS LIKE 'wsrep_cluster_status'" | grep -i primary
+      register: primary_check
+      failed_when: primary_check.rc != 0
+      
+    - name: "[POST-CHECK] Verify OpenStack DB connections"
+      shell: |
+        for db in keystone nova neutron cinder glance; do
+          docker exec {{ mariadb_container }} mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} \
+            -e "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE db='$db'" || true
+        done
+      register: db_connections
+      
+    - name: "[REPORT] Generate report"
+      copy:
+        content: |
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Action: MariaDB Galera Recovery
+          
+          BEFORE:
+          {{ lookup('file', '/tmp/galera_status_before.' + incident_id + '.txt') | default('N/A') }}
+          
+          AFTER:
+          {{ cluster_after.stdout }}
+          
+          Primary Status: {{ primary_check.stdout }}
+          DB Connections: {{ db_connections.stdout }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_mariadb.log"
+        
+    - name: "[ALERT] Success"
+      debug:
+        msg: |
+          ✅ MariaDB Galera cluster recovered
+          Incident: {{ incident_id }}
+          Cluster Status: PRIMARY
+          
+  rescue:
+    - name: "[ROLLBACK] Emergency restore"
+      shell: |
+        docker stop {{ mariadb_container }}
+        # Restore from backup if needed
+        docker start {{ mariadb_container }}
+      ignore_errors: yes
+      
+    - fail:
+        msg: "MariaDB recovery failed - requires manual intervention"

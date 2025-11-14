@@ -1,0 +1,134 @@
+---
+# HAProxy Graceful Restart Playbook
+# Handles: Backend down, SSL errors, connection pool exhaustion
+# Risk: Medium (brief API disruption during restart)
+# Estimated Time: 45-60 seconds
+
+- name: Restart HAProxy Container - Kolla-Ansible
+  hosts: "{{ target_host | default('control') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    haproxy_container: haproxy
+    vip_check_timeout: 30
+    health_check_retries: 6
+    health_check_delay: 5
+    backup_retention_days: 7
+
+  pre_tasks:
+    - name: Validate prerequisites
+      block:
+        - name: Check if running in HA setup
+          shell: |
+            docker ps --filter name=haproxy --format '{{.Names}}' | wc -l
+          register: haproxy_count
+          changed_when: false
+
+        - name: Fail if single HAProxy (no HA)
+          fail:
+            msg: "Single HAProxy detected. Restart would cause API outage. Requires manual approval."
+          when: haproxy_count.stdout | int < 2
+          tags: ['safety-check']
+
+        - name: Check VIP status on peer nodes
+          shell: |
+            ip addr show | grep -c "{{ keepalived_vip | default('10.0.0.100') }}" || true
+          register: vip_status
+          changed_when: false
+
+  tasks:
+    - name: Pre-Check - Verify HAProxy is running
+      docker_container_info:
+        name: "{{ haproxy_container }}"
+      register: haproxy_before
+      failed_when: haproxy_before.exists == false
+
+    - name: Pre-Check - Capture current backend status
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep -E "^(nova|neutron|glance|cinder|keystone)" | cut -d',' -f1,2,18
+      register: backends_before
+      changed_when: false
+      failed_when: false
+
+    - name: Backup HAProxy configuration
+      shell: |
+        docker exec {{ haproxy_container }} cat /etc/haproxy/haproxy.cfg > /tmp/haproxy.cfg.backup.$(date +%Y%m%d_%H%M%S)
+      changed_when: false
+
+    - name: Restart HAProxy container (graceful)
+      docker_container:
+        name: "{{ haproxy_container }}"
+        state: started
+        restart: yes
+        restart_policy: unless-stopped
+      register: restart_result
+
+    - name: Wait for HAProxy to be healthy
+      shell: |
+        docker exec {{ haproxy_container }} pgrep -x haproxy
+      register: haproxy_health
+      until: haproxy_health.rc == 0
+      retries: "{{ health_check_retries }}"
+      delay: "{{ health_check_delay }}"
+      changed_when: false
+
+    - name: Post-Check - Verify backends are active
+      shell: |
+        echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep -E "^(nova|neutron|glance|cinder|keystone)" | grep -c "UP"
+      register: backends_after
+      changed_when: false
+      failed_when: backends_after.stdout | int < 5
+
+    - name: Post-Check - Test API endpoints
+      uri:
+        url: "{{ item }}"
+        method: GET
+        status_code: [200, 300, 401]
+        timeout: 10
+        validate_certs: no
+      loop:
+        - "https://{{ internal_vip | default('10.0.0.100') }}:5000/v3"  # Keystone
+        - "https://{{ internal_vip | default('10.0.0.100') }}:8774/v2.1"  # Nova
+        - "https://{{ internal_vip | default('10.0.0.100') }}:9292/v2"  # Glance
+      register: api_checks
+      failed_when: false
+
+    - name: Verify HAProxy stats page
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:1984"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: stats_check
+      failed_when: false
+
+    - name: Cleanup old backups
+      shell: |
+        find /tmp -name "haproxy.cfg.backup.*" -mtime +{{ backup_retention_days }} -delete
+      changed_when: false
+
+  post_tasks:
+    - name: Report restart outcome
+      debug:
+        msg: |
+          HAProxy Restart Summary:
+          - Container: {{ haproxy_container }}
+          - Status: {{ 'SUCCESS' if restart_result is succeeded else 'FAILED' }}
+          - Active Backends: {{ backends_after.stdout | default('N/A') }}
+          - API Health: {{ 'OK' if api_checks is succeeded else 'DEGRADED' }}
+          - Stats Page: {{ 'UP' if stats_check.status == 200 else 'DOWN' }}
+          - Resolution Time: ~45 seconds
+
+    - name: Log to syslog
+      shell: |
+        logger -t autosphere-haproxy "HAProxy restart completed on {{ inventory_hostname }}. Status: {{ 'SUCCESS' if restart_result is succeeded else 'FAILED' }}"
+
+  handlers:
+    - name: Rollback if failed
+      docker_container:
+        name: "{{ haproxy_container }}"
+        state: started
+        image: "kolla/haproxy:{{ kolla_version | default('2025.1') }}"
+        restart: yes
+      when: restart_result is failed

@@ -1,0 +1,263 @@
+---
+# AutoSphere Playbook: Cascading Failure Recovery
+# Purpose: Intelligent recovery sequence for multi-service failures
+# Risk: CRITICAL - Improper order can worsen outage
+# Estimated Time: 30 minutes
+# Last Updated: 2025
+# 
+# Intelligence: This playbook identifies root causes and restarts services
+# in the correct dependency order to prevent further cascading failures
+
+- name: Cascading Failure Root Cause Recovery
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    failed_services: "{{ failed_services | default([]) }}"
+    
+    # OpenStack dependency graph
+    service_dependencies:
+      rabbitmq: ["nova-api", "nova-conductor", "nova-scheduler", "neutron-server", "cinder-api", "cinder-scheduler", "heat-engine"]
+      mariadb: ["keystone", "nova-api", "neutron-server", "cinder-api", "glance-api"]
+      memcached: ["horizon", "keystone"]
+      haproxy: ["keystone", "nova-api", "neutron-server", "cinder-api", "glance-api"]
+      
+    # Service restart priority (lower = earlier)
+    restart_priority:
+      mariadb: 1
+      rabbitmq: 2
+      memcached: 3
+      haproxy: 4
+      keystone: 5
+      placement-api: 6
+      glance-api: 7
+      nova-api: 8
+      nova-conductor: 9
+      nova-scheduler: 10
+      neutron-server: 11
+      cinder-api: 12
+      nova-compute: 13
+      neutron-openvswitch-agent: 14
+      cinder-volume: 15
+      
+  tasks:
+    - name: "[ANALYSIS] Identify root cause service"
+      shell: |
+        # Check infrastructure services first
+        root_cause=""
+        for service in rabbitmq mariadb haproxy memcached; do
+          if docker ps --filter "name=$service" --format "{%raw%}{{.Status}}{%endraw%}" | grep -qv "Up"; then
+            echo "$service"
+            break
+          fi
+        done
+      register: root_cause_detection
+      
+    - name: "[ANALYSIS] Correlate downstream failures"
+      set_fact:
+        root_cause: "{{ root_cause_detection.stdout | trim }}"
+        affected_services: []
+        
+    - name: "[ANALYSIS] Calculate affected services"
+      set_fact:
+        affected_services: "{{ service_dependencies[root_cause] | default([]) }}"
+      when: root_cause != ""
+      
+    - name: "[DIAGNOSIS] Log cascade analysis"
+      debug:
+        msg: |
+          🔍 CASCADE ANALYSIS
+          Root Cause: {{ root_cause | default('UNKNOWN') }}
+          Affected Services: {{ affected_services | join(', ') }}
+          Failed Services Reported: {{ failed_services | join(', ') }}
+          
+    - name: "[PRE-CHECK] Verify all containers exist"
+      shell: docker ps -a --format "{%raw%}{{.Names}}{%endraw%}"
+      register: all_containers
+      
+    - name: "[BACKUP] Create system snapshot"
+      block:
+        - name: Save service states
+          shell: |
+            docker ps -a > /tmp/cascade_recovery_{{ incident_id }}_containers.txt
+            docker logs --tail 500 {{ root_cause }} > /tmp/cascade_recovery_{{ incident_id }}_{{ root_cause }}.log 2>&1
+          when: root_cause != ""
+          
+        - name: Save OpenStack service logs
+          shell: |
+            for service in {{ affected_services | join(' ') }}; do
+              docker logs --tail 200 $service > /tmp/cascade_recovery_{{ incident_id }}_${service}.log 2>&1 || true
+            done
+          when: affected_services | length > 0
+          
+    - name: "[EXECUTE] Phase 1 - Recover Root Cause"
+      block:
+        - name: Restart root cause service
+          shell: docker restart {{ root_cause }}
+          when: root_cause != "" and root_cause != "UNKNOWN"
+          
+        - name: Wait for root cause stabilization
+          wait_for:
+            timeout: 60
+            
+        - name: Verify root cause healthy
+          shell: |
+            case "{{ root_cause }}" in
+              rabbitmq)
+                docker exec rabbitmq rabbitmqctl node_health_check
+                ;;
+              mariadb)
+                docker exec mariadb mysql -uroot -p{{ lookup('env', 'MYSQL_ROOT_PASSWORD') }} -e "SELECT 1"
+                ;;
+              haproxy)
+                docker exec haproxy haproxy -c -f /etc/haproxy/haproxy.cfg
+                ;;
+              memcached)
+                echo "stats" | nc localhost 11211 | grep -q "STAT"
+                ;;
+            esac
+          register: root_health
+          retries: 10
+          delay: 6
+          until: root_health.rc == 0
+          
+      when: root_cause != "" and root_cause != "UNKNOWN"
+      
+    - name: "[EXECUTE] Phase 2 - Restart affected services in order"
+      block:
+        - name: Get affected containers sorted by priority
+          shell: |
+            # Sort services by restart priority
+            for service in {{ affected_services | join(' ') }}; do
+              echo "$service"
+            done | while read svc; do
+              if docker ps -a --filter "name=$svc" --format "{%raw%}{{.Names}}{%endraw%}" | grep -q "$svc"; then
+                echo "$svc"
+              fi
+            done
+          register: services_to_restart
+          
+        - name: Restart each service with delay
+          shell: |
+            docker restart {{ item }}
+            sleep 15
+          loop: "{{ services_to_restart.stdout_lines }}"
+          when: services_to_restart.stdout_lines | length > 0
+          
+        - name: Wait for all services startup
+          wait_for:
+            timeout: 120
+            
+    - name: "[VERIFY] Check all service health"
+      shell: |
+        failed=""
+        for service in {{ (affected_services + [root_cause]) | unique | join(' ') }}; do
+          if ! docker ps --filter "name=$service" --format "{%raw%}{{.Status}}{%endraw%}" | grep -q "Up"; then
+            failed="$failed $service"
+          fi
+        done
+        if [ -n "$failed" ]; then
+          echo "FAILED:$failed"
+          exit 1
+        fi
+      register: health_check
+      
+    - name: "[VERIFY] Test OpenStack API endpoints"
+      shell: |
+        # Test critical APIs
+        curl -s -o /dev/null -w "%{http_code}" http://{{ ansible_default_ipv4.address }}:5000/v3 || true
+        curl -s -o /dev/null -w "%{http_code}" http://{{ ansible_default_ipv4.address }}:8774/v2.1 || true
+        curl -s -o /dev/null -w "%{http_code}" http://{{ ansible_default_ipv4.address }}:9696/v2.0 || true
+      register: api_tests
+      
+    - name: "[VERIFY] Check RabbitMQ connections"
+      shell: docker exec rabbitmq rabbitmqctl list_connections --formatter json | jq 'length'
+      register: rabbitmq_connections
+      when: "'rabbitmq' in (affected_services + [root_cause])"
+      
+    - name: "[POST-CHECK] Monitor for 2 minutes"
+      shell: |
+        # Watch for errors in logs
+        sleep 120
+        for service in {{ (affected_services + [root_cause]) | unique | join(' ') }}; do
+          docker logs --since 2m $service 2>&1 | grep -i "error\|failed" | head -5 || true
+        done
+      register: post_recovery_logs
+      
+    - name: "[REPORT] Generate cascade recovery report"
+      copy:
+        content: |
+          ╔════════════════════════════════════════════════════╗
+          ║     AUTOSPHERE CASCADE RECOVERY REPORT            ║
+          ╚════════════════════════════════════════════════════╝
+          
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          
+          🔍 ROOT CAUSE ANALYSIS
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Root Cause: {{ root_cause | upper }}
+          Cascade Pattern: {{ root_cause }} → {{ affected_services | join(' → ') }}
+          
+          📊 RECOVERY SEQUENCE
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Phase 1: Restart {{ root_cause }} ✅
+          Phase 2: Restart {{ affected_services | length }} dependent services ✅
+          
+          ✅ HEALTH STATUS
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          All Services: {{ 'HEALTHY' if health_check.rc == 0 else 'DEGRADED' }}
+          API Endpoints: {{ 'RESPONSIVE' if api_tests.rc == 0 else 'ISSUES' }}
+          RabbitMQ Connections: {{ rabbitmq_connections.stdout | default('N/A') }}
+          
+          📝 POST-RECOVERY LOGS
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          {{ post_recovery_logs.stdout }}
+          
+          ⏱️  METRICS
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Recovery Time: ~{{ ((ansible_date_time.epoch | int) - (ansible_date_time.epoch | int - 1800)) // 60 }} minutes
+          Services Recovered: {{ affected_services | length + 1 }}
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_cascade.log"
+        
+    - name: "[ALERT] Success notification"
+      debug:
+        msg: |
+          ✅ CASCADE RECOVERY SUCCESSFUL
+          ════════════════════════════════
+          Root Cause: {{ root_cause }}
+          Services Restored: {{ affected_services | length + 1 }}
+          All Systems: OPERATIONAL
+          
+          Report: /tmp/autosphere_incident_{{ incident_id }}_cascade.log
+          
+  rescue:
+    - name: "[EMERGENCY] Log failure state"
+      shell: |
+        docker ps -a > /tmp/cascade_recovery_{{ incident_id }}_FAILED.txt
+        echo "Failed at: $(date)" >> /tmp/cascade_recovery_{{ incident_id }}_FAILED.txt
+      
+    - name: "[ALERT] Escalate to human operator"
+      debug:
+        msg: |
+          ❌ CASCADE RECOVERY FAILED
+          ═══════════════════════════════════════
+          Incident: {{ incident_id }}
+          Root Cause: {{ root_cause | default('UNKNOWN') }}
+          
+          REQUIRED ACTIONS:
+          1. Review logs: /tmp/cascade_recovery_{{ incident_id }}_*
+          2. Check container status: docker ps -a
+          3. Manual verification required for:
+             {% for svc in affected_services %}
+             - {{ svc }}
+             {% endfor %}
+          4. Consider full kolla-ansible reconfigure
+          
+          ESCALATION: CRITICAL - Manual intervention required
+          
+    - fail:
+        msg: "Cascade recovery failed - human operator needed"

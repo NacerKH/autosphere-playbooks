@@ -1,0 +1,23 @@
+---
+# Ansible Collections Required for AutoSphere Playbooks
+# Install with: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  # Core Ansible collections
+  - name: ansible.builtin
+    version: ">=2.10.0"
+  
+  # For Docker container management
+  - name: community.docker
+    version: ">=3.0.0"
+  
+  # For general utilities
+  - name: community.general
+    version: ">=6.0.0"
+  
+  # For OpenStack operations
+  - name: openstack.cloud
+    version: ">=2.0.0"
+
+# Python dependencies (install via pip)
+# pip install --break-system-packages docker openstack-sdk pyyaml jinja2

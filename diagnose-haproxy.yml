@@ -1,0 +1,286 @@
+---
+# HAProxy Master Diagnostic & Remediation Playbook
+# Intelligent problem detection and automated remediation selection
+# Risk: Variable (depends on selected remediation)
+# Estimated Time: 60-180 seconds
+
+- name: HAProxy Diagnostic and Auto-Remediation
+  hosts: "{{ target_host | default('control') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    haproxy_container: haproxy
+    diagnostic_mode: "{{ diag_mode | default('auto') }}"  # auto, manual, report-only
+    auto_remediate: "{{ auto_fix | default(true) }}"
+    severity_threshold: "{{ threshold | default('high') }}"  # critical, high, medium, low
+
+  pre_tasks:
+    - name: Initialize diagnostic results
+      set_fact:
+        diagnostic_findings: []
+        recommended_actions: []
+        severity_level: "info"
+
+  tasks:
+    - name: "Phase 1: Core HAProxy Service Check"
+      block:
+        - name: Check if HAProxy container is running
+          docker_container_info:
+            name: "{{ haproxy_container }}"
+          register: haproxy_status
+          failed_when: false
+
+        - name: Diagnose - HAProxy container not running
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['HAProxy container is not running'] }}"
+            recommended_actions: "{{ recommended_actions + ['restart-haproxy.yml'] }}"
+            severity_level: "critical"
+          when: not haproxy_status.exists or not haproxy_status.container.State.Running
+
+        - name: Check HAProxy process health
+          shell: |
+            docker exec {{ haproxy_container }} pgrep -x haproxy
+          register: haproxy_process
+          failed_when: false
+          changed_when: false
+          when: haproxy_status.exists and haproxy_status.container.State.Running
+
+        - name: Diagnose - HAProxy process not running
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['HAProxy process is dead inside container'] }}"
+            recommended_actions: "{{ recommended_actions + ['restart-haproxy.yml'] }}"
+            severity_level: "critical"
+          when: 
+            - haproxy_status.exists
+            - haproxy_status.container.State.Running
+            - haproxy_process.rc != 0
+
+    - name: "Phase 2: Backend Health Analysis"
+      block:
+        - name: Get all backend statistics
+          shell: |
+            echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND"
+          register: backend_stats
+          changed_when: false
+          failed_when: false
+
+        - name: Count DOWN backends
+          shell: |
+            echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND" | grep -c "DOWN" || true
+          register: down_backend_count
+          changed_when: false
+
+        - name: Identify specific DOWN backends
+          shell: |
+            echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND" | grep "DOWN" | cut -d',' -f1
+          register: down_backends_list
+          changed_when: false
+          when: down_backend_count.stdout | int > 0
+
+        - name: Diagnose - Backends are DOWN
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['Backends DOWN: ' + down_backends_list.stdout_lines | join(', ')] }}"
+            recommended_actions: "{{ recommended_actions + ['fix-haproxy-backend.yml'] }}"
+            severity_level: "{{ 'critical' if down_backend_count.stdout | int > 2 else 'high' }}"
+          when: down_backend_count.stdout | int > 0
+
+        - name: Check backend response times
+          shell: |
+            echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "BACKEND" | awk -F',' '{if($6 > 2000) print $1","$6}'
+          register: slow_backends
+          changed_when: false
+
+        - name: Diagnose - Slow backend response times
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['Slow backends detected: ' + slow_backends.stdout_lines | join(', ')] }}"
+            recommended_actions: "{{ recommended_actions + ['optimize-haproxy-healthchecks.yml'] }}"
+            severity_level: "{{ 'high' if severity_level != 'critical' else severity_level }}"
+          when: slow_backends.stdout != ''
+
+    - name: "Phase 3: Connection Pool Analysis"
+      block:
+        - name: Get current connection count
+          shell: |
+            docker exec {{ haproxy_container }} ss -tan | grep -c ESTABLISHED || true
+          register: established_connections
+          changed_when: false
+
+        - name: Get TIME_WAIT connection count
+          shell: |
+            docker exec {{ haproxy_container }} ss -tan | grep -c TIME_WAIT || true
+          register: timewait_connections
+          changed_when: false
+
+        - name: Diagnose - High connection count
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['High connection count: ' + established_connections.stdout + ' ESTABLISHED, ' + timewait_connections.stdout + ' TIME_WAIT'] }}"
+            recommended_actions: "{{ recommended_actions + ['cleanup-haproxy-connections.yml'] }}"
+            severity_level: "{{ 'high' if severity_level == 'info' else severity_level }}"
+          when: 
+            - established_connections.stdout | int > 2000
+            - timewait_connections.stdout | int > 500
+
+        - name: Check frontend connection queues
+          shell: |
+            echo "show stat" | docker exec -i {{ haproxy_container }} socat stdio /run/haproxy/admin.sock | grep "FRONTEND" | awk -F',' '{if($3 > 100) print $1","$3}'
+          register: queued_connections
+          changed_when: false
+
+        - name: Diagnose - High connection queue depth
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['High queue depth on frontends: ' + queued_connections.stdout_lines | join(', ')] }}"
+            recommended_actions: "{{ recommended_actions + ['cleanup-haproxy-connections.yml'] }}"
+            severity_level: "{{ 'high' if severity_level == 'info' else severity_level }}"
+          when: queued_connections.stdout != ''
+
+    - name: "Phase 4: SSL Certificate Analysis"
+      block:
+        - name: Check certificate expiry
+          shell: |
+            docker exec {{ haproxy_container }} openssl x509 -in /var/lib/kolla/config_files/src/haproxy.pem -noout -checkend 2592000
+          register: cert_expiry_check
+          changed_when: false
+          failed_when: false
+
+        - name: Get certificate expiry date
+          shell: |
+            docker exec {{ haproxy_container }} openssl x509 -in /var/lib/kolla/config_files/src/haproxy.pem -noout -enddate | cut -d'=' -f2
+          register: cert_expiry_date
+          changed_when: false
+
+        - name: Diagnose - Certificate expiring soon or expired
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['SSL certificate expiring: ' + cert_expiry_date.stdout] }}"
+            recommended_actions: "{{ recommended_actions + ['renew-haproxy-ssl.yml'] }}"
+            severity_level: "{{ 'critical' if cert_expiry_check.rc != 0 else 'high' if severity_level == 'info' else severity_level }}"
+          when: cert_expiry_check.rc != 0
+
+        - name: Check for SSL handshake errors in logs
+          shell: |
+            docker logs {{ haproxy_container }} --since 10m 2>&1 | grep -i "ssl" | grep -i "error" | tail -10
+          register: ssl_errors
+          changed_when: false
+          failed_when: false
+
+        - name: Diagnose - SSL errors detected
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['SSL errors detected in logs'] }}"
+            recommended_actions: "{{ recommended_actions + ['renew-haproxy-ssl.yml'] }}"
+            severity_level: "{{ 'high' if severity_level == 'info' else severity_level }}"
+          when: ssl_errors.stdout != ''
+
+    - name: "Phase 5: Configuration Validation"
+      block:
+        - name: Test HAProxy configuration syntax
+          shell: |
+            docker exec {{ haproxy_container }} haproxy -c -f /etc/haproxy/haproxy.cfg
+          register: config_test
+          changed_when: false
+          failed_when: false
+
+        - name: Diagnose - Configuration syntax errors
+          set_fact:
+            diagnostic_findings: "{{ diagnostic_findings + ['HAProxy configuration has syntax errors'] }}"
+            recommended_actions: "{{ recommended_actions + ['optimize-haproxy-healthchecks.yml'] }}"
+            severity_level: "high"
+          when: config_test.rc != 0
+
+    - name: "Phase 6: Generate Diagnostic Report"
+      block:
+        - name: Create diagnostic report
+          set_fact:
+            diagnostic_report: |
+              ======================================
+              HAProxy Diagnostic Report
+              ======================================
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Host: {{ inventory_hostname }}
+              Severity: {{ severity_level | upper }}
+              
+              Findings ({{ diagnostic_findings | length }}):
+              {% for finding in diagnostic_findings %}
+              - {{ finding }}
+              {% endfor %}
+              
+              Recommended Actions:
+              {% for action in recommended_actions | unique %}
+              - ansible-playbook {{ action }} -e "target_host={{ inventory_hostname }}"
+              {% endfor %}
+              
+              Connection Statistics:
+              - ESTABLISHED: {{ established_connections.stdout | default('N/A') }}
+              - TIME_WAIT: {{ timewait_connections.stdout | default('N/A') }}
+              
+              Backend Status:
+              - Total Backends: {{ backend_stats.stdout_lines | length | default('N/A') }}
+              - DOWN Backends: {{ down_backend_count.stdout | default('N/A') }}
+              
+              Certificate Status:
+              - Expiry: {{ cert_expiry_date.stdout | default('N/A') }}
+              
+              ======================================
+
+        - name: Display diagnostic report
+          debug:
+            msg: "{{ diagnostic_report.split('\n') }}"
+
+        - name: Save diagnostic report to file
+          copy:
+            content: "{{ diagnostic_report }}"
+            dest: "/var/log/autosphere/haproxy_diagnostic_{{ ansible_date_time.epoch }}.txt"
+          changed_when: false
+
+    - name: "Phase 7: Auto-Remediation (if enabled)"
+      block:
+        - name: Execute primary remediation playbook
+          include_tasks: "{{ recommended_actions[0] }}"
+          when:
+            - recommended_actions | length > 0
+            - auto_remediate | bool
+            - severity_level in ['critical', 'high']
+
+        - name: Log remediation action
+          shell: |
+            logger -t autosphere-haproxy "Auto-remediation executed: {{ recommended_actions[0] | default('none') }} on {{ inventory_hostname }}"
+          when:
+            - recommended_actions | length > 0
+            - auto_remediate | bool
+      when: diagnostic_mode == 'auto'
+
+  post_tasks:
+    - name: Final Summary
+      debug:
+        msg: |
+          HAProxy Diagnostic Complete:
+          - Mode: {{ diagnostic_mode }}
+          - Severity: {{ severity_level }}
+          - Issues Found: {{ diagnostic_findings | length }}
+          - Actions Recommended: {{ recommended_actions | unique | length }}
+          - Auto-Remediation: {{ 'Executed' if (auto_remediate and diagnostic_mode == 'auto') else 'Disabled' }}
+          - Report: /var/log/autosphere/haproxy_diagnostic_{{ ansible_date_time.epoch }}.txt
+
+    - name: Update Redmine ticket (if integrated)
+      shell: |
+        echo "Diagnostic complete. Findings: {{ diagnostic_findings | length }}. Severity: {{ severity_level }}" >> /var/log/autosphere/haproxy_remediation.log
+      changed_when: false
+
+    - name: Fail if critical issues found and auto-remediation disabled
+      fail:
+        msg: "CRITICAL: HAProxy issues detected but auto-remediation is disabled. Manual intervention required."
+      when:
+        - severity_level == 'critical'
+        - not auto_remediate
+
+# Usage Examples:
+# 1. Full diagnostic with auto-fix:
+#    ansible-playbook diagnose-haproxy.yml
+#
+# 2. Diagnostic only (report mode):
+#    ansible-playbook diagnose-haproxy.yml -e "auto_remediate=false"
+#
+# 3. Manual mode (requires confirmation):
+#    ansible-playbook diagnose-haproxy.yml -e "diagnostic_mode=manual"
+#
+# 4. Specific host:
+#    ansible-playbook diagnose-haproxy.yml -e "target_host=control01"

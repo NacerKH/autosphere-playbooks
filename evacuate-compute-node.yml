@@ -1,0 +1,204 @@
+---
+# AutoSphere Playbook: Nova Compute Node Evacuation
+# Purpose: Safely evacuate VMs before compute node maintenance/restart
+# Risk: HIGH - VM migration can fail if resources insufficient
+# Estimated Time: 5-60 minutes (depends on VM count)
+# Last Updated: 2025
+
+- name: Nova Compute Node Evacuation
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    incident_id: "{{ incident_id | default('AUTO') }}"
+    compute_node: "{{ compute_hostname }}"
+    force_evacuation: "{{ force | default(false) }}"
+    skip_shared_storage: "{{ skip_shared | default(false) }}"
+    
+  tasks:
+    - name: "[PRE-CHECK] Verify compute node exists"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack compute service list --service nova-compute --host {{ compute_node }} --format json
+      register: compute_check
+      failed_when: compute_check.stdout == "[]"
+      
+    - name: "[PRE-CHECK] List VMs on compute node"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack server list --host {{ compute_node }} --all-projects --format json
+      register: vm_list
+      
+    - name: "[PRE-CHECK] Check available compute capacity"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack hypervisor stats show --format json
+      register: capacity_check
+      
+    - name: "[ANALYSIS] Verify sufficient capacity for evacuation"
+      set_fact:
+        vm_count: "{{ (vm_list.stdout | from_json) | length }}"
+        available_vcpus: "{{ (capacity_check.stdout | from_json).free_vcpus }}"
+        available_ram: "{{ (capacity_check.stdout | from_json).free_ram_mb }}"
+        
+    - name: "[DECISION] Check if evacuation is safe"
+      assert:
+        that:
+          - vm_count | int > 0
+          - available_vcpus | int > 0 or force_evacuation
+        fail_msg: "Insufficient capacity for evacuation. Use force=true to override."
+        
+    - name: "[BACKUP] Save VM state information"
+      shell: |
+        mkdir -p /tmp/vm_evacuation_{{ incident_id }}
+        source /etc/kolla/admin-openrc.sh
+        openstack server list --host {{ compute_node }} --all-projects --format json \
+          > /tmp/vm_evacuation_{{ incident_id }}/vms_before.json
+          
+    - name: "[EXECUTE] Disable compute service"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack compute service set --disable {{ compute_node }} nova-compute \
+          --disable-reason "AutoSphere evacuation - {{ incident_id }}"
+          
+    - name: "[EXECUTE] Evacuate VMs"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        
+        {% if skip_shared_storage %}
+        # Evacuate without shared storage (rebuilds VMs)
+        nova host-evacuate --on-shared-storage {{ compute_node }}
+        {% else %}
+        # Standard evacuation
+        nova host-evacuate {{ compute_node }}
+        {% endif %}
+      register: evacuation_output
+      async: 3600
+      poll: 30
+      
+    - name: "[MONITOR] Track evacuation progress"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        remaining=$(openstack server list --host {{ compute_node }} --all-projects --format json | jq '. | length')
+        echo "Remaining VMs on {{ compute_node }}: $remaining"
+        exit $remaining
+      register: evacuation_progress
+      retries: 60
+      delay: 30
+      until: evacuation_progress.rc == 0
+      ignore_errors: yes
+      
+    - name: "[VERIFY] Confirm all VMs evacuated"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack server list --host {{ compute_node }} --all-projects --format json
+      register: final_vm_list
+      failed_when: (final_vm_list.stdout | from_json) | length > 0
+      
+    - name: "[VERIFY] Check evacuated VM states"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        cat /tmp/vm_evacuation_{{ incident_id }}/vms_before.json | \
+          jq -r '.[].ID' | \
+          while read vm_id; do
+            state=$(openstack server show $vm_id -f json | jq -r '.status')
+            host=$(openstack server show $vm_id -f json | jq -r '."OS-EXT-SRV-ATTR:host"')
+            echo "$vm_id: $state on $host"
+          done
+      register: vm_states
+      
+    - name: "[POST-CHECK] Verify VMs are active"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        failed_vms=0
+        cat /tmp/vm_evacuation_{{ incident_id }}/vms_before.json | \
+          jq -r '.[].ID' | \
+          while read vm_id; do
+            state=$(openstack server show $vm_id -f json | jq -r '.status')
+            if [ "$state" != "ACTIVE" ] && [ "$state" != "SHUTOFF" ]; then
+              echo "FAILED: $vm_id is $state"
+              ((failed_vms++))
+            fi
+          done
+        exit $failed_vms
+      register: vm_health_check
+      failed_when: vm_health_check.rc > 0
+      
+    - name: "[OPTIONAL] Restart compute service"
+      when: restart_after_evacuation | default(false)
+      block:
+        - name: Restart nova-compute container
+          shell: docker restart nova_compute
+          
+        - name: Wait for compute service up
+          wait_for:
+            timeout: 60
+            
+        - name: Enable compute service
+          shell: |
+            source /etc/kolla/admin-openrc.sh
+            openstack compute service set --enable {{ compute_node }} nova-compute
+            
+    - name: "[REPORT] Generate evacuation report"
+      copy:
+        content: |
+          ========================================
+          NOVA COMPUTE NODE EVACUATION
+          ========================================
+          
+          Incident ID: {{ incident_id }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Compute Node: {{ compute_node }}
+          
+          VMs BEFORE: {{ vm_count }}
+          
+          EVACUATION DETAILS:
+          {{ evacuation_output.stdout }}
+          
+          VMs AFTER EVACUATION:
+          {{ vm_states.stdout }}
+          
+          HEALTH CHECK: {{ 'PASS' if vm_health_check.rc == 0 else 'FAIL' }}
+          
+          Available Capacity:
+          - vCPUs: {{ available_vcpus }}
+          - RAM: {{ available_ram }} MB
+          
+          Duration: {{ (ansible_date_time.epoch | int) - (start_time | default(ansible_date_time.epoch | int)) }} seconds
+          
+        dest: "/tmp/autosphere_incident_{{ incident_id }}_evacuation.log"
+        
+    - name: "[ALERT] Evacuation complete"
+      debug:
+        msg: |
+          ✅ Compute node evacuation completed
+          
+          Node: {{ compute_node }}
+          VMs Evacuated: {{ vm_count }}
+          Status: {{ 'SUCCESS' if vm_health_check.rc == 0 else 'PARTIAL' }}
+          
+          Report: /tmp/autosphere_incident_{{ incident_id }}_evacuation.log
+          
+  rescue:
+    - name: "[ROLLBACK] Re-enable compute service"
+      shell: |
+        source /etc/kolla/admin-openrc.sh
+        openstack compute service set --enable {{ compute_node }} nova-compute
+      ignore_errors: yes
+      
+    - name: "[ALERT] Evacuation failed"
+      debug:
+        msg: |
+          ❌ EVACUATION FAILED
+          
+          Some VMs may be in ERROR state
+          Check: /tmp/autosphere_incident_{{ incident_id }}_evacuation.log
+          
+          Manual recovery:
+          1. openstack server list --host {{ compute_node }} --all-projects
+          2. For each ERROR VM: openstack server reset-state --active <vm-id>
+          3. Consider manual migration: nova live-migration <vm-id> <target-host>
+          
+    - fail:
+        msg: "Evacuation failed - manual intervention required"
