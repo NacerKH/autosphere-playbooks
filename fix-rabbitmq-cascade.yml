@@ -1,7 +1,7 @@
 ---
 # RabbitMQ to Nova Cascade Failure Fix
 # Intelligent workflow to fix cascading failures: RabbitMQ → Nova, Neutron, Cinder
-# Part of AutoSphere self-healing system
+# Outputs structured JSON for LLM decision-making
 
 - name: Fix RabbitMQ Cascade Failure
   hosts: openstack_controllers
@@ -10,243 +10,319 @@
   vars:
     cascade_detected: false
     fix_stages:
-      - name: "diagnosis"
-        status: "pending"
-      - name: "rabbitmq_fix"
-        status: "pending"
-      - name: "services_recovery"
-        status: "pending"
-      - name: "verification"
-        status: "pending"
+      diagnosis: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      rabbitmq_fix: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      services_recovery: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      verification: { status: "pending", start_time: "", end_time: "", duration: 0 }
 
   tasks:
     # STAGE 1: DIAGNOSIS
-    - name: "STAGE 1 - Detect cascade failure pattern"
+    - name: "STAGE 1 - START - Detect cascade failure pattern"
+      set_fact:
+        stage1_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Check RabbitMQ status
+      shell: |
+        docker exec rabbitmq rabbitmqctl cluster_status --formatter json
+      register: rabbit_status
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check Nova service status
+      shell: |
+        docker exec nova_api nova-manage service list | grep -c "XXX" || true
+      register: nova_down_count
+      changed_when: false
+
+    - name: Check Neutron agent status
+      shell: |
+        docker exec neutron_server neutron agent-list -f json | jq -r '.[] | select(.alive==false) | .agent_type' | wc -l
+      register: neutron_down_count
+      changed_when: false
+
+    - name: Check timeout errors in logs
+      shell: |
+        find /var/log/kolla -name "*.log" -mmin -15 -exec grep -l "MessagingTimeout\|TimeoutError" {} \; | wc -l
+      register: timeout_count
+      changed_when: false
+
+    - name: Determine if cascade failure exists
+      set_fact:
+        cascade_detected: >-
+          {{ (rabbit_status.rc != 0 or 'running' not in rabbit_status.stdout) and
+             ((nova_down_count.stdout | int > 0) or (neutron_down_count.stdout | int > 0)) and
+             (timeout_count.stdout | int > 5) }}
+
+    - name: "STAGE 1 - END - Update diagnosis stage"
+      set_fact:
+        stage1_end: "{{ ansible_date_time.epoch }}"
+        fix_stages: "{{ fix_stages | combine({'diagnosis': {'status': 'complete', 'start_time': stage1_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage1_start | int)}}) }}"
+
+    - name: Abort if no cascade detected
       block:
-        - name: Check RabbitMQ status
-          shell: |
-            docker exec rabbitmq rabbitmqctl cluster_status --formatter json
-          register: rabbit_status
-          ignore_errors: yes
-          changed_when: false
-
-        - name: Check Nova service status
-          shell: |
-            docker exec nova_api nova-manage service list | grep -c "XXX" || true
-          register: nova_down_count
-          changed_when: false
-
-        - name: Check Neutron agent status
-          shell: |
-            docker exec neutron_server neutron agent-list -f json | jq -r '.[] | select(.alive==false) | .agent_type' | wc -l
-          register: neutron_down_count
-          changed_when: false
-
-        - name: Check timeout errors in logs
-          shell: |
-            find /var/log/kolla -name "*.log" -mmin -15 -exec grep -l "MessagingTimeout\|TimeoutError" {} \; | wc -l
-          register: timeout_count
-          changed_when: false
-
-        - name: Determine if cascade failure exists
-          set_fact:
-            cascade_detected: >-
-              {{ (rabbit_status.rc != 0 or 'running' not in rabbit_status.stdout) and
-                 ((nova_down_count.stdout | int > 0) or (neutron_down_count.stdout | int > 0)) and
-                 (timeout_count.stdout | int > 5) }}
-
-        - name: Update diagnosis stage
-          set_fact:
-            fix_stages: "{{ fix_stages | combine({'0': {'name': 'diagnosis', 'status': 'complete'}}, recursive=True) }}"
-
-        - name: Display diagnosis
-          debug:
-            msg: |
-              ╔════════════════════════════════════════════════════════════╗
-              ║        CASCADE FAILURE DIAGNOSIS                           ║
-              ╚════════════════════════════════════════════════════════════╝
-              
-              🔍 DETECTION RESULTS:
-              └─ RabbitMQ Healthy: {{ rabbit_status.rc == 0 }}
-              └─ Nova Services Down: {{ nova_down_count.stdout }}
-              └─ Neutron Agents Down: {{ neutron_down_count.stdout }}
-              └─ Timeout Errors (15min): {{ timeout_count.stdout }}
-              
-              🔥 CASCADE FAILURE: {{ 'YES - PROCEEDING WITH FIX' if cascade_detected else 'NO - ABORTING' }}
-              
-              ╚════════════════════════════════════════════════════════════╝
-
-        - name: Abort if no cascade detected
-          fail:
-            msg: "No cascade failure detected - manual investigation required"
-          when: not cascade_detected
-
-    # STAGE 2: RABBITMQ FIX
-    - name: "STAGE 2 - Fix RabbitMQ cluster"
-      block:
-        - name: Stop RabbitMQ gracefully
-          shell: |
-            docker exec rabbitmq rabbitmqctl stop_app
-          retries: 3
-          delay: 5
-
-        - name: Wait for clean stop
-          pause:
-            seconds: 10
-
-        - name: Start RabbitMQ
-          shell: |
-            docker exec rabbitmq rabbitmqctl start_app
-          retries: 3
-          delay: 5
-
-        - name: Verify RabbitMQ recovered
-          shell: |
-            docker exec rabbitmq rabbitmqctl cluster_status --formatter json
-          register: rabbit_fix_verify
-          retries: 10
-          delay: 10
-          until: rabbit_fix_verify.rc == 0 and 'running' in rabbit_fix_verify.stdout
-
-        - name: Update RabbitMQ fix stage
-          set_fact:
-            fix_stages: "{{ fix_stages | combine({'1': {'name': 'rabbitmq_fix', 'status': 'complete'}}, recursive=True) }}"
-
-        - name: Display RabbitMQ fix result
-          debug:
-            msg: "✅ RabbitMQ cluster recovered successfully"
-
-    # STAGE 3: SERVICES RECOVERY
-    - name: "STAGE 3 - Recover dependent services"
-      block:
-        - name: Wait for RabbitMQ to stabilize
-          pause:
-            seconds: 30
-            prompt: "Waiting for RabbitMQ connections to establish..."
-
-        - name: Restart Nova services
-          shell: |
-            docker restart nova_api nova_scheduler nova_conductor nova_compute
-          ignore_errors: yes
-
-        - name: Wait for Nova initialization
-          pause:
-            seconds: 20
-
-        - name: Restart Neutron services
-          shell: |
-            docker restart neutron_server neutron_l3_agent neutron_dhcp_agent neutron_openvswitch_agent
-          ignore_errors: yes
-
-        - name: Wait for Neutron initialization
-          pause:
-            seconds: 20
-
-        - name: Restart Cinder services
-          shell: |
-            docker restart cinder_api cinder_scheduler cinder_volume
-          ignore_errors: yes
-
-        - name: Update services recovery stage
-          set_fact:
-            fix_stages: "{{ fix_stages | combine({'2': {'name': 'services_recovery', 'status': 'complete'}}, recursive=True) }}"
-
-        - name: Display services recovery result
-          debug:
-            msg: "✅ OpenStack services restarted"
-
-    # STAGE 4: VERIFICATION
-    - name: "STAGE 4 - Verify full recovery"
-      block:
-        - name: Verify Nova services
-          shell: |
-            docker exec nova_api nova-manage service list | grep -c ":-)" || true
-          register: nova_verify
-          retries: 10
-          delay: 10
-          until: nova_verify.stdout | int > 0
-
-        - name: Verify Neutron agents
-          shell: |
-            docker exec neutron_server neutron agent-list -f json | jq -r '.[] | select(.alive==true) | .agent_type' | wc -l
-          register: neutron_verify
-          retries: 10
-          delay: 10
-          until: neutron_verify.stdout | int > 0
-
-        - name: Check for new timeout errors
-          shell: |
-            find /var/log/kolla -name "*.log" -mmin -5 -exec grep -l "MessagingTimeout\|TimeoutError" {} \; | wc -l
-          register: new_timeout_count
-          changed_when: false
-
-        - name: Verify API endpoints
-          uri:
-            url: "http://{{ ansible_default_ipv4.address }}:{{ item.port }}/{{ item.path }}"
-            method: GET
-            status_code: [200, 300]
-            validate_certs: no
-          loop:
-            - { port: 8774, path: "v2.1" }
-            - { port: 9696, path: "v2.0" }
-            - { port: 8776, path: "v3" }
-          register: api_verify
-          ignore_errors: yes
-
-        - name: Calculate recovery success
-          set_fact:
-            recovery_success: >-
-              {{ (nova_verify.stdout | int > 0) and
-                 (neutron_verify.stdout | int > 0) and
-                 (new_timeout_count.stdout | int < 3) and
-                 (api_verify.results | selectattr('status', 'in', [200, 300]) | list | length == 3) }}
-
-        - name: Update verification stage
-          set_fact:
-            fix_stages: "{{ fix_stages | combine({'3': {'name': 'verification', 'status': 'complete' if recovery_success else 'failed'}}, recursive=True) }}"
-
-        - name: Generate final report
+        - name: Generate no-action report
           set_fact:
             cascade_fix_report:
-              timestamp: "{{ ansible_date_time.iso8601 }}"
-              hostname: "{{ inventory_hostname }}"
-              cascade_detected: "{{ cascade_detected }}"
-              fix_stages_completed: "{{ fix_stages | length }}"
-              nova_services_recovered: "{{ nova_verify.stdout }}"
-              neutron_agents_recovered: "{{ neutron_verify.stdout }}"
-              new_timeouts: "{{ new_timeout_count.stdout }}"
-              apis_healthy: "{{ api_verify.results | selectattr('status', 'in', [200, 300]) | list | length }}"
-              overall_success: "{{ recovery_success }}"
+              meta:
+                report_type: "cascade_failure_fix"
+                timestamp: "{{ ansible_date_time.iso8601 }}"
+                hostname: "{{ inventory_hostname }}"
+                execution_id: "{{ ansible_date_time.epoch }}"
+                playbook_version: "1.0.0"
+              detection:
+                cascade_found: false
+                rabbitmq_healthy: "{{ rabbit_status.rc == 0 }}"
+                nova_services_down: "{{ nova_down_count.stdout | int }}"
+                neutron_agents_down: "{{ neutron_down_count.stdout | int }}"
+                timeout_errors: "{{ timeout_count.stdout | int }}"
+              decision:
+                action_taken: "none"
+                reasoning: "No cascade failure pattern detected - system appears healthy or requires manual investigation"
+                status: "aborted"
 
-        - name: Display final summary
+        - name: Output parseable no-action result
           debug:
             msg: |
-              ╔════════════════════════════════════════════════════════════╗
-              ║        CASCADE FAILURE FIX - FINAL REPORT                  ║
-              ╚════════════════════════════════════════════════════════════╝
-              
-              📅 Timestamp: {{ cascade_fix_report.timestamp }}
-              🖥️  Host: {{ cascade_fix_report.hostname }}
-              
-              ✅ STAGES COMPLETED: {{ cascade_fix_report.fix_stages_completed }}/4
-              
-              📊 RECOVERY STATUS:
-              └─ Nova Services: {{ cascade_fix_report.nova_services_recovered }}
-              └─ Neutron Agents: {{ cascade_fix_report.neutron_agents_recovered }}
-              └─ New Timeouts: {{ cascade_fix_report.new_timeouts }}
-              └─ APIs Healthy: {{ cascade_fix_report.apis_healthy }}/3
-              
-              🎯 OVERALL: {{ 'SUCCESS - System Recovered' if cascade_fix_report.overall_success else 'PARTIAL - Manual Review Needed' }}
-              
-              ╚════════════════════════════════════════════════════════════╝
+              === AUTOSPHERE CASCADE FIX RESULT ===
+              STATUS=ABORTED
+              CASCADE_DETECTED=false
+              ACTION_TAKEN=none
+              REASONING=No cascade failure detected
+              === END CASCADE FIX RESULT ===
 
-        - name: Save cascade fix report
-          copy:
-            content: "{{ cascade_fix_report | to_nice_json }}"
-            dest: "/var/log/autosphere/cascade_fix_{{ ansible_date_time.epoch }}.json"
-          delegate_to: localhost
+        - fail:
+            msg: "No cascade failure detected - manual investigation required"
+      when: not cascade_detected
 
-        - name: Fail if recovery incomplete
-          fail:
-            msg: "Cascade failure fix incomplete - manual intervention required"
-          when: not recovery_success
+    # STAGE 2: RABBITMQ FIX
+    - name: "STAGE 2 - START - Fix RabbitMQ cluster"
+      set_fact:
+        stage2_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Stop RabbitMQ gracefully
+      shell: |
+        docker exec rabbitmq rabbitmqctl stop_app
+      retries: 3
+      delay: 5
+
+    - name: Wait for clean stop
+      pause:
+        seconds: 10
+
+    - name: Start RabbitMQ
+      shell: |
+        docker exec rabbitmq rabbitmqctl start_app
+      retries: 3
+      delay: 5
+
+    - name: Verify RabbitMQ recovered
+      shell: |
+        docker exec rabbitmq rabbitmqctl cluster_status --formatter json
+      register: rabbit_fix_verify
+      retries: 10
+      delay: 10
+      until: rabbit_fix_verify.rc == 0 and 'running' in rabbit_fix_verify.stdout
+
+    - name: "STAGE 2 - END - Update RabbitMQ fix stage"
+      set_fact:
+        stage2_end: "{{ ansible_date_time.epoch }}"
+        fix_stages: "{{ fix_stages | combine({'rabbitmq_fix': {'status': 'complete', 'start_time': stage2_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage2_start | int)}}) }}"
+
+    # STAGE 3: SERVICES RECOVERY
+    - name: "STAGE 3 - START - Recover dependent services"
+      set_fact:
+        stage3_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Wait for RabbitMQ to stabilize
+      pause:
+        seconds: 30
+
+    - name: Restart Nova services
+      shell: |
+        docker restart nova_api nova_scheduler nova_conductor nova_compute
+      ignore_errors: yes
+
+    - name: Wait for Nova initialization
+      pause:
+        seconds: 20
+
+    - name: Restart Neutron services
+      shell: |
+        docker restart neutron_server neutron_l3_agent neutron_dhcp_agent neutron_openvswitch_agent
+      ignore_errors: yes
+
+    - name: Wait for Neutron initialization
+      pause:
+        seconds: 20
+
+    - name: Restart Cinder services
+      shell: |
+        docker restart cinder_api cinder_scheduler cinder_volume
+      ignore_errors: yes
+
+    - name: "STAGE 3 - END - Update services recovery stage"
+      set_fact:
+        stage3_end: "{{ ansible_date_time.epoch }}"
+        fix_stages: "{{ fix_stages | combine({'services_recovery': {'status': 'complete', 'start_time': stage3_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage3_start | int)}}) }}"
+
+    # STAGE 4: VERIFICATION
+    - name: "STAGE 4 - START - Verify full recovery"
+      set_fact:
+        stage4_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Verify Nova services
+      shell: |
+        docker exec nova_api nova-manage service list | grep -c ":-)" || true
+      register: nova_verify
+      retries: 10
+      delay: 10
+      until: nova_verify.stdout | int > 0
+
+    - name: Verify Neutron agents
+      shell: |
+        docker exec neutron_server neutron agent-list -f json | jq -r '.[] | select(.alive==true) | .agent_type' | wc -l
+      register: neutron_verify
+      retries: 10
+      delay: 10
+      until: neutron_verify.stdout | int > 0
+
+    - name: Check for new timeout errors
+      shell: |
+        find /var/log/kolla -name "*.log" -mmin -5 -exec grep -l "MessagingTimeout\|TimeoutError" {} \; | wc -l
+      register: new_timeout_count
+      changed_when: false
+
+    - name: Verify API endpoints
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:{{ item.port }}/{{ item.path }}"
+        method: GET
+        status_code: [200, 300]
+        validate_certs: no
+      loop:
+        - { port: 8774, path: "v2.1" }
+        - { port: 9696, path: "v2.0" }
+        - { port: 8776, path: "v3" }
+      register: api_verify
+      ignore_errors: yes
+
+    - name: Calculate recovery success
+      set_fact:
+        recovery_success: >-
+          {{ (nova_verify.stdout | int > 0) and
+             (neutron_verify.stdout | int > 0) and
+             (new_timeout_count.stdout | int < 3) and
+             (api_verify.results | selectattr('status', 'in', [200, 300]) | list | length == 3) }}
+
+    - name: "STAGE 4 - END - Update verification stage"
+      set_fact:
+        stage4_end: "{{ ansible_date_time.epoch }}"
+        fix_stages: "{{ fix_stages | combine({'verification': {'status': ('complete' if recovery_success else 'failed'), 'start_time': stage4_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage4_start | int)}}) }}"
+
+    - name: Calculate total execution time
+      set_fact:
+        total_duration: "{{ stage4_end | int - stage1_start | int }}"
+
+    - name: Determine next recommended action
+      set_fact:
+        next_action: >-
+          {{ 'Run health check (template ID: 10) to verify full recovery' if recovery_success else
+             'Collect diagnostics (template ID: 17) and escalate to manual intervention' }}
+
+    - name: Generate LLM-friendly cascade fix report
+      set_fact:
+        cascade_fix_report:
+          meta:
+            report_type: "cascade_failure_fix"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            execution_id: "{{ ansible_date_time.epoch }}"
+            playbook_version: "1.0.0"
+            total_duration_seconds: "{{ total_duration | int }}"
+          detection:
+            cascade_found: true
+            rabbitmq_healthy_before: false
+            nova_services_down: "{{ nova_down_count.stdout | int }}"
+            neutron_agents_down: "{{ neutron_down_count.stdout | int }}"
+            timeout_errors_before: "{{ timeout_count.stdout | int }}"
+          execution:
+            stages_completed: 4
+            stages:
+              diagnosis: "{{ fix_stages.diagnosis }}"
+              rabbitmq_fix: "{{ fix_stages.rabbitmq_fix }}"
+              services_recovery: "{{ fix_stages.services_recovery }}"
+              verification: "{{ fix_stages.verification }}"
+          results:
+            nova_services_recovered: "{{ nova_verify.stdout | int }}"
+            neutron_agents_recovered: "{{ neutron_verify.stdout | int }}"
+            new_timeouts: "{{ new_timeout_count.stdout | int }}"
+            apis_healthy_count: "{{ api_verify.results | selectattr('status', 'in', [200, 300]) | list | length }}"
+            apis_total_count: 3
+          status:
+            overall: "{{ 'success' if recovery_success else 'partial_failure' }}"
+            recovery_complete: "{{ recovery_success }}"
+            confidence: "{{ 0.95 if recovery_success else 0.50 }}"
+          decision:
+            action_taken: "cascade_failure_fix_completed"
+            next_recommended_action: "{{ next_action }}"
+            next_template: "{{ 'autosphere-openstack-health' if recovery_success else 'autosphere-collect-diagnostics' }}"
+            next_template_id: "{{ 10 if recovery_success else 17 }}"
+            reasoning: "{{ 'Full cascade fix successful - verify with health check' if recovery_success else 'Partial recovery - diagnostics needed for manual review' }}"
+            manual_intervention_required: "{{ not recovery_success }}"
+
+    - name: Save LLM-friendly JSON report
+      copy:
+        content: "{{ cascade_fix_report | to_nice_json }}"
+        dest: "/var/log/autosphere/cascade_fix_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE CASCADE FIX RESULT ===
+          STATUS={{ cascade_fix_report.status.overall | upper }}
+          RECOVERY_COMPLETE={{ cascade_fix_report.status.recovery_complete }}
+          CONFIDENCE={{ cascade_fix_report.status.confidence }}
+          STAGES_COMPLETED={{ cascade_fix_report.execution.stages_completed }}
+          TOTAL_DURATION={{ cascade_fix_report.meta.total_duration_seconds }}s
+          NOVA_RECOVERED={{ cascade_fix_report.results.nova_services_recovered }}
+          NEUTRON_RECOVERED={{ cascade_fix_report.results.neutron_agents_recovered }}
+          NEXT_ACTION={{ cascade_fix_report.decision.next_recommended_action }}
+          NEXT_TEMPLATE_ID={{ cascade_fix_report.decision.next_template_id }}
+          MANUAL_INTERVENTION={{ cascade_fix_report.decision.manual_intervention_required }}
+          REPORT_FILE=/var/log/autosphere/cascade_fix_{{ ansible_date_time.epoch }}.json
+          === END CASCADE FIX RESULT ===
+
+    - name: Display human-readable summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║        CASCADE FAILURE FIX - FINAL REPORT                  ║
+          ╚════════════════════════════════════════════════════════════╝
+          
+          📅 Timestamp: {{ cascade_fix_report.meta.timestamp }}
+          🖥️  Host: {{ cascade_fix_report.meta.hostname }}
+          ⏱️  Duration: {{ cascade_fix_report.meta.total_duration_seconds }}s
+          
+          ✅ STAGES COMPLETED: {{ cascade_fix_report.execution.stages_completed }}/4
+          
+          📊 RECOVERY STATUS:
+          └─ Nova Services: {{ cascade_fix_report.results.nova_services_recovered }}
+          └─ Neutron Agents: {{ cascade_fix_report.results.neutron_agents_recovered }}
+          └─ New Timeouts: {{ cascade_fix_report.results.new_timeouts }}
+          └─ APIs Healthy: {{ cascade_fix_report.results.apis_healthy_count }}/{{ cascade_fix_report.results.apis_total_count }}
+          
+          🎯 OVERALL: {{ cascade_fix_report.status.overall | upper }}
+          📈 CONFIDENCE: {{ (cascade_fix_report.status.confidence | float * 100) | round(0) }}%
+          
+          💡 NEXT ACTION:
+          {{ cascade_fix_report.decision.next_recommended_action }}
+          Template: {{ cascade_fix_report.decision.next_template }} (ID: {{ cascade_fix_report.decision.next_template_id }})
+          
+          ╚════════════════════════════════════════════════════════════╝
+
+    - name: Fail if recovery incomplete (triggers manual review)
+      fail:
+        msg: |
+          PARTIAL RECOVERY: {{ cascade_fix_report.decision.reasoning }}
+          Manual intervention required. Execute template ID {{ cascade_fix_report.decision.next_template_id }} for diagnostics.
+      when: not recovery_success

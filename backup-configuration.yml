@@ -1,0 +1,144 @@
+---
+# Configuration Backup Playbook
+# Creates comprehensive backup before making changes
+# Part of AutoSphere safety mechanisms
+
+- name: OpenStack Configuration Backup
+  hosts: openstack_controllers
+  gather_facts: yes
+  become: yes
+  vars:
+    backup_dir: "/var/backups/autosphere"
+    backup_timestamp: "{{ ansible_date_time.epoch }}"
+    config_paths:
+      - /etc/kolla
+      - /etc/haproxy
+      - /var/lib/docker/volumes/kolla_logs/_data
+    retention_days: 30
+
+  tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}/{{ backup_timestamp }}"
+        state: directory
+        mode: '0750'
+
+    - name: Backup Kolla configuration
+      archive:
+        path: /etc/kolla
+        dest: "{{ backup_dir }}/{{ backup_timestamp }}/kolla-config.tar.gz"
+        format: gz
+      register: kolla_backup
+
+    - name: Backup HAProxy configuration
+      archive:
+        path: /etc/haproxy
+        dest: "{{ backup_dir }}/{{ backup_timestamp }}/haproxy-config.tar.gz"
+        format: gz
+      register: haproxy_backup
+      ignore_errors: yes
+
+    - name: Export RabbitMQ definitions
+      shell: |
+        docker exec rabbitmq rabbitmqctl export_definitions {{ backup_dir }}/{{ backup_timestamp }}/rabbitmq-definitions.json
+      register: rabbit_backup
+      ignore_errors: yes
+
+    - name: Backup MariaDB configuration
+      shell: |
+        docker exec mariadb mysqldump --all-databases --single-transaction --quick > {{ backup_dir }}/{{ backup_timestamp }}/mariadb-full.sql
+      register: mariadb_backup
+      ignore_errors: yes
+
+    - name: Get container list
+      shell: |
+        docker ps -a --format "{{{{.Names}}}}" > {{ backup_dir }}/{{ backup_timestamp }}/container-list.txt
+      register: container_list
+
+    - name: Save OpenStack service status
+      shell: |
+        docker exec nova_api nova-manage service list > {{ backup_dir }}/{{ backup_timestamp }}/nova-services.txt
+        docker exec neutron_server neutron agent-list > {{ backup_dir }}/{{ backup_timestamp }}/neutron-agents.txt
+        docker exec cinder_api cinder service-list > {{ backup_dir }}/{{ backup_timestamp }}/cinder-services.txt
+      ignore_errors: yes
+
+    - name: Create backup manifest
+      copy:
+        content: |
+          Backup Created: {{ ansible_date_time.iso8601 }}
+          Hostname: {{ inventory_hostname }}
+          Backup ID: {{ backup_timestamp }}
+          
+          Files:
+          - kolla-config.tar.gz ({{ kolla_backup.state }})
+          - haproxy-config.tar.gz ({{ haproxy_backup.state | default('skipped') }})
+          - rabbitmq-definitions.json ({{ 'created' if rabbit_backup.rc == 0 else 'failed' }})
+          - mariadb-full.sql ({{ 'created' if mariadb_backup.rc == 0 else 'failed' }})
+          - container-list.txt
+          - *-services.txt (OpenStack status)
+          
+          Total Size: {{ backup_size.stdout | default('calculating...') }}
+        dest: "{{ backup_dir }}/{{ backup_timestamp }}/MANIFEST.txt"
+
+    - name: Calculate backup size
+      shell: |
+        du -sh {{ backup_dir }}/{{ backup_timestamp }} | awk '{print $1}'
+      register: backup_size
+      changed_when: false
+
+    - name: Clean old backups
+      find:
+        paths: "{{ backup_dir }}"
+        age: "{{ retention_days }}d"
+        file_type: directory
+      register: old_backups
+
+    - name: Remove old backups
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"
+      when: old_backups.matched > 0
+
+    - name: Generate backup report
+      set_fact:
+        backup_report:
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          backup_id: "{{ backup_timestamp }}"
+          hostname: "{{ inventory_hostname }}"
+          backup_path: "{{ backup_dir }}/{{ backup_timestamp }}"
+          backup_size: "{{ backup_size.stdout }}"
+          kolla_config: "{{ kolla_backup.state }}"
+          rabbitmq_defs: "{{ rabbit_backup.rc == 0 }}"
+          mariadb_dump: "{{ mariadb_backup.rc == 0 }}"
+          old_backups_removed: "{{ old_backups.matched | default(0) }}"
+          status: "success"
+
+    - name: Display backup summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║        CONFIGURATION BACKUP SUMMARY                        ║
+          ╚════════════════════════════════════════════════════════════╝
+          
+          📅 Timestamp: {{ backup_report.timestamp }}
+          🆔 Backup ID: {{ backup_report.backup_id }}
+          🖥️  Host: {{ backup_report.hostname }}
+          
+          📁 Backup Location: {{ backup_report.backup_path }}
+          💾 Total Size: {{ backup_report.backup_size }}
+          
+          ✅ Components Backed Up:
+             └─ Kolla Config: {{ backup_report.kolla_config }}
+             └─ RabbitMQ Defs: {{ backup_report.rabbitmq_defs }}
+             └─ MariaDB Dump: {{ backup_report.mariadb_dump }}
+          
+          🗑️  Old Backups Removed: {{ backup_report.old_backups_removed }}
+          
+          ╚════════════════════════════════════════════════════════════╝
+
+    - name: Save backup report
+      copy:
+        content: "{{ backup_report | to_nice_json }}"
+        dest: "/var/log/autosphere/backup_{{ backup_timestamp }}.json"
+      delegate_to: localhost

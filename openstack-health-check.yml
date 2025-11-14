@@ -1,7 +1,7 @@
 ---
 # OpenStack Health Check Playbook
 # Comprehensive health monitoring for AutoSphere self-healing
-# Detects issues with OpenStack services for intelligent remediation
+# Outputs structured JSON for LLM decision-making
 
 - name: OpenStack Services Health Check
   hosts: openstack_controllers
@@ -107,77 +107,143 @@
           {{ (not rabbitmq_healthy) and 
              (nova_services.rc != 0 or neutron_agents.rc != 0 or cinder_services.rc != 0) }}
 
-    - name: Generate health report
+    - name: Determine severity level
+      set_fact:
+        severity_level: >-
+          {{ 'critical' if cascade_pattern else 
+             ('high' if timeout_errors.stdout_lines | length > 10 else 
+             ('medium' if timeout_errors.stdout_lines | length > 5 else 
+             ('low' if timeout_errors.stdout_lines | length > 0 else 'healthy'))) }}
+
+    - name: Determine recommended action
+      set_fact:
+        recommended_action: >-
+          {{ 'IMMEDIATE: Run autosphere-fix-cascade template (ID: 14)' if cascade_pattern else
+             ('URGENT: Investigate timeout errors and consider RabbitMQ restart (template ID: 11)' if timeout_errors.stdout_lines | length > 10 else
+             ('MONITOR: Check logs for patterns' if timeout_errors.stdout_lines | length > 0 else
+             'NONE: System healthy')) }}
+
+    - name: Calculate confidence score
+      set_fact:
+        confidence_score: >-
+          {{ 0.95 if cascade_pattern else
+             (0.80 if timeout_errors.stdout_lines | length > 10 else
+             (0.60 if timeout_errors.stdout_lines | length > 5 else 0.30)) }}
+
+    - name: Generate LLM-friendly health report
       set_fact:
         openstack_health:
-          timestamp: "{{ ansible_date_time.iso8601 }}"
-          hostname: "{{ inventory_hostname }}"
-          overall_status: "{{ 'critical' if cascade_pattern else ('warning' if timeout_errors.stdout_lines | length > 0 else 'healthy') }}"
-          rabbitmq:
-            status: "{{ 'healthy' if rabbitmq_healthy else 'critical' }}"
-            error_count: "{{ rabbitmq_errors.stdout | int }}"
-          galera:
-            cluster_size: "{{ galera_cluster_size.stdout | default('unknown') }}"
-            status: "{{ 'healthy' if (galera_cluster_size.stdout | default('0') | int >= 3) else 'warning' }}"
-          services:
-            containers: "{{ container_status.results | selectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
-            containers_down: "{{ container_status.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}"
-          api_endpoints:
-            healthy: "{{ api_health.results | selectattr('status', 'in', [200, 300]) | map(attribute='item.name') | list }}"
-            unhealthy: "{{ api_health.results | rejectattr('status', 'in', [200, 300]) | map(attribute='item.name') | list }}"
+          meta:
+            report_type: "openstack_health_check"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            playbook_version: "1.0.0"
+            execution_id: "{{ ansible_date_time.epoch }}"
+          status:
+            overall: "{{ 'critical' if cascade_pattern else ('warning' if timeout_errors.stdout_lines | length > 0 else 'healthy') }}"
+            severity: "{{ severity_level }}"
+            confidence: "{{ confidence_score | float }}"
+          components:
+            rabbitmq:
+              status: "{{ 'healthy' if rabbitmq_healthy else 'critical' }}"
+              healthy: "{{ rabbitmq_healthy }}"
+              error_count: "{{ rabbitmq_errors.stdout | int }}"
+              impact: "high"
+            galera:
+              status: "{{ 'healthy' if (galera_cluster_size.stdout | default('0') | int >= 3) else 'warning' }}"
+              cluster_size: "{{ galera_cluster_size.stdout | default('unknown') }}"
+              expected_size: 3
+              impact: "critical"
+            nova:
+              status: "{{ 'healthy' if nova_services.rc == 0 else 'critical' }}"
+              services_down: "{{ 'unknown' if nova_services.rc != 0 else 0 }}"
+              impact: "high"
+            neutron:
+              status: "{{ 'healthy' if neutron_agents.rc == 0 else 'critical' }}"
+              agents_down: "{{ 'unknown' if neutron_agents.rc != 0 else 0 }}"
+              impact: "high"
+            cinder:
+              status: "{{ 'healthy' if cinder_services.rc == 0 else 'warning' }}"
+              services_down: "{{ 'unknown' if cinder_services.rc != 0 else 0 }}"
+              impact: "medium"
+            apis:
+              healthy_count: "{{ api_health.results | selectattr('status', 'in', [200, 300]) | list | length }}"
+              unhealthy_count: "{{ api_health.results | rejectattr('status', 'in', [200, 300]) | list | length }}"
+              total_count: 5
+              unhealthy_services: "{{ api_health.results | rejectattr('status', 'in', [200, 300]) | map(attribute='item.name') | list }}"
           errors:
-            timeout_files: "{{ timeout_errors.stdout_lines | length }}"
-            timeout_logs: "{{ timeout_errors.stdout_lines[:5] }}"
-          cascade_failure_detected: "{{ cascade_pattern }}"
-          recommended_action: >-
-            {{ 'Restart RabbitMQ cluster immediately - cascade failure detected' if cascade_pattern
-               else ('Investigate timeout errors' if timeout_errors.stdout_lines | length > 0
-               else 'No action needed - system healthy') }}
+            timeout_files_count: "{{ timeout_errors.stdout_lines | length }}"
+            timeout_sample: "{{ timeout_errors.stdout_lines[:3] }}"
+            rabbitmq_errors: "{{ rabbitmq_errors.stdout | int }}"
+          detection:
+            cascade_failure: "{{ cascade_pattern }}"
+            cascade_confidence: "{{ 0.95 if cascade_pattern else 0.0 }}"
+            root_cause: "{{ 'rabbitmq_failure' if (not rabbitmq_healthy) else ('timeout_cascade' if timeout_errors.stdout_lines | length > 10 else 'none') }}"
+          decision:
+            action_required: "{{ cascade_pattern or (timeout_errors.stdout_lines | length > 5) }}"
+            recommended_template: "{{ 'autosphere-fix-cascade' if cascade_pattern else ('autosphere-rabbitmq-restart' if timeout_errors.stdout_lines | length > 10 else 'none') }}"
+            recommended_template_id: "{{ 14 if cascade_pattern else (11 if timeout_errors.stdout_lines | length > 10 else 0) }}"
+            priority: "{{ 'immediate' if cascade_pattern else ('high' if timeout_errors.stdout_lines | length > 10 else ('medium' if timeout_errors.stdout_lines | length > 0 else 'none')) }}"
+            reasoning: "{{ recommended_action }}"
+            expected_outcome: "{{ 'Full service recovery' if cascade_pattern else ('Restored messaging' if timeout_errors.stdout_lines | length > 10 else 'Continued monitoring') }}"
 
-    - name: Save health report
+    - name: Save LLM-friendly JSON report
       copy:
         content: "{{ openstack_health | to_nice_json }}"
         dest: "/var/log/autosphere/health_{{ ansible_date_time.epoch }}.json"
       delegate_to: localhost
 
-    - name: Display health summary
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE HEALTH CHECK RESULT ===
+          STATUS={{ openstack_health.status.overall | upper }}
+          SEVERITY={{ openstack_health.status.severity | upper }}
+          CONFIDENCE={{ openstack_health.status.confidence }}
+          CASCADE_FAILURE={{ openstack_health.detection.cascade_failure }}
+          ROOT_CAUSE={{ openstack_health.detection.root_cause }}
+          ACTION_REQUIRED={{ openstack_health.decision.action_required }}
+          RECOMMENDED_TEMPLATE={{ openstack_health.decision.recommended_template }}
+          TEMPLATE_ID={{ openstack_health.decision.recommended_template_id }}
+          PRIORITY={{ openstack_health.decision.priority | upper }}
+          REASONING={{ openstack_health.decision.reasoning }}
+          REPORT_FILE=/var/log/autosphere/health_{{ ansible_date_time.epoch }}.json
+          === END HEALTH CHECK RESULT ===
+
+    - name: Display human-readable summary
       debug:
         msg: |
           ╔════════════════════════════════════════════════════════════╗
           ║        OPENSTACK HEALTH CHECK SUMMARY                      ║
           ╚════════════════════════════════════════════════════════════╝
           
-          📅 Timestamp: {{ openstack_health.timestamp }}
-          🖥️  Host: {{ openstack_health.hostname }}
+          📅 Timestamp: {{ openstack_health.meta.timestamp }}
+          🖥️  Host: {{ openstack_health.meta.hostname }}
           
-          ⚡ OVERALL STATUS: {{ openstack_health.overall_status | upper }}
+          ⚡ OVERALL STATUS: {{ openstack_health.status.overall | upper }}
+          🎯 SEVERITY: {{ openstack_health.status.severity | upper }}
+          📊 CONFIDENCE: {{ (openstack_health.status.confidence | float * 100) | round(0) }}%
           
-          🐰 RabbitMQ: {{ openstack_health.rabbitmq.status }}
-             └─ Errors (last 10m): {{ openstack_health.rabbitmq.error_count }}
+          🐰 RabbitMQ: {{ openstack_health.components.rabbitmq.status | upper }}
+          💾 Galera: {{ openstack_health.components.galera.status | upper }}
+          💻 Nova: {{ openstack_health.components.nova.status | upper }}
+          🌐 Neutron: {{ openstack_health.components.neutron.status | upper }}
+          💿 Cinder: {{ openstack_health.components.cinder.status | upper }}
           
-          💾 Galera Cluster: {{ openstack_health.galera.status }}
-             └─ Cluster Size: {{ openstack_health.galera.cluster_size }}
-          
-          🔧 Containers Down: {{ openstack_health.services.containers_down | length }}
-             {% if openstack_health.services.containers_down | length > 0 %}
-             └─ {{ openstack_health.services.containers_down | join(', ') }}
-             {% endif %}
-          
-          🌐 API Endpoints Unhealthy: {{ openstack_health.api_endpoints.unhealthy | length }}
-             {% if openstack_health.api_endpoints.unhealthy | length > 0 %}
-             └─ {{ openstack_health.api_endpoints.unhealthy | join(', ') }}
-             {% endif %}
-          
-          ⚠️  Timeout Errors: {{ openstack_health.errors.timeout_files }}
-          
-          🔥 CASCADE FAILURE: {{ 'YES - CRITICAL!' if openstack_health.cascade_failure_detected else 'NO' }}
+          🔥 CASCADE FAILURE: {{ 'YES' if openstack_health.detection.cascade_failure else 'NO' }}
           
           💡 RECOMMENDED ACTION:
-          {{ openstack_health.recommended_action }}
+          Priority: {{ openstack_health.decision.priority | upper }}
+          {{ openstack_health.decision.reasoning }}
+          {% if openstack_health.decision.recommended_template_id | int > 0 %}
+          Execute: {{ openstack_health.decision.recommended_template }} (Template ID: {{ openstack_health.decision.recommended_template_id }})
+          {% endif %}
           
           ╚════════════════════════════════════════════════════════════╝
 
-    - name: Fail if critical
+    - name: Fail if critical (for AWX conditional workflows)
       fail:
-        msg: "Critical health issues detected: {{ openstack_health.recommended_action }}"
-      when: openstack_health.overall_status == 'critical'
+        msg: |
+          CRITICAL: {{ openstack_health.decision.reasoning }}
+          Execute template ID {{ openstack_health.decision.recommended_template_id }} immediately.
+      when: openstack_health.status.overall == 'critical'

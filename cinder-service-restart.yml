@@ -1,0 +1,127 @@
+---
+# Cinder Service Restart Playbook
+# Restarts Cinder block storage services
+# Part of AutoSphere self-healing system
+
+- name: Cinder Services Restart and Recovery
+  hosts: openstack_controllers:openstack_storage
+  gather_facts: yes
+  become: yes
+  vars:
+    cinder_services:
+      - cinder_api
+      - cinder_scheduler
+      - cinder_volume
+      - cinder_backup
+    restart_delay: 15
+
+  tasks:
+    - name: Check current Cinder service status
+      shell: |
+        docker exec cinder_api cinder service-list
+      register: pre_service_status
+      ignore_errors: yes
+      changed_when: false
+      run_once: true
+
+    - name: Identify down services
+      set_fact:
+        down_services: "{{ pre_service_status.stdout_lines | select('search', 'down|XXX') | list }}"
+
+    - name: Stop Cinder containers
+      shell: |
+        docker stop {{ item }}
+      loop: "{{ cinder_services }}"
+      register: stop_result
+      ignore_errors: yes
+
+    - name: Wait for clean shutdown
+      pause:
+        seconds: "{{ restart_delay }}"
+
+    - name: Start Cinder containers
+      shell: |
+        docker start {{ item }}
+      loop: "{{ cinder_services }}"
+      register: start_result
+      ignore_errors: yes
+
+    - name: Wait for services to initialize
+      pause:
+        seconds: "{{ restart_delay }}"
+
+    - name: Verify Cinder API responding
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:8776/v3"
+        method: GET
+        status_code: [200, 300]
+        validate_certs: no
+      register: cinder_api_check
+      retries: 10
+      delay: 5
+      until: cinder_api_check.status in [200, 300]
+
+    - name: Check post-restart service status
+      shell: |
+        docker exec cinder_api cinder service-list
+      register: post_service_status
+      retries: 10
+      delay: 10
+      until: post_service_status.rc == 0
+      changed_when: false
+      run_once: true
+
+    - name: Count services up
+      shell: |
+        docker exec cinder_api cinder service-list | grep -c "up" || true
+      register: services_up
+      changed_when: false
+      run_once: true
+
+    - name: Test volume operations
+      shell: |
+        docker exec cinder_api openstack volume list --limit 1 -f json
+      register: volume_test
+      ignore_errors: yes
+      changed_when: false
+      run_once: true
+
+    - name: Generate restart report
+      set_fact:
+        cinder_restart_report:
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          hostname: "{{ inventory_hostname }}"
+          services_before_down: "{{ down_services | length }}"
+          services_after_up: "{{ services_up.stdout | int }}"
+          api_responsive: "{{ cinder_api_check.status in [200, 300] }}"
+          volume_operations_working: "{{ volume_test.rc == 0 }}"
+          overall_status: "{{ 'success' if (services_up.stdout | int > 0) and (volume_test.rc == 0) else 'partial' }}"
+
+    - name: Display restart summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║        CINDER SERVICES RESTART SUMMARY                     ║
+          ╚════════════════════════════════════════════════════════════╝
+          
+          📅 Timestamp: {{ cinder_restart_report.timestamp }}
+          🖥️  Host: {{ cinder_restart_report.hostname }}
+          
+          📊 Services Status:
+             └─ Before: {{ cinder_restart_report.services_before_down }} down
+             └─ After: {{ cinder_restart_report.services_after_up }} up
+          
+          🌐 API Responsive: {{ cinder_restart_report.api_responsive }}
+          💾 Volume Operations: {{ 'Working' if cinder_restart_report.volume_operations_working else 'Issues detected' }}
+          
+          ✅ OVERALL: {{ cinder_restart_report.overall_status | upper }}
+          
+          ╚════════════════════════════════════════════════════════════╝
+      run_once: true
+
+    - name: Save restart report
+      copy:
+        content: "{{ cinder_restart_report | to_nice_json }}"
+        dest: "/var/log/autosphere/cinder_restart_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+      run_once: true
