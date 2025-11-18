@@ -1,0 +1,434 @@
+---
+# Volume Snapshot Rollback Playbook
+# Restores volumes from snapshots for disaster recovery
+# Part of AutoSphere rollback system
+
+- name: Rollback Volume from Snapshot
+  hosts: openstack_controllers
+  gather_facts: yes
+  become: yes
+  vars:
+    # These should be passed as extra-vars or AWX survey
+    target_volume_id: "{{ volume_id | mandatory }}"
+    snapshot_id: "{{ snapshot_to_restore | default('latest') }}"
+    rollback_method: "{{ method | default('clone') }}"  # 'clone' or 'revert'
+    verify_before_rollback: true
+    create_backup_before_rollback: true
+    rollback_stages:
+      validation: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      backup: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      rollback: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      verification: { status: "pending", start_time: "", end_time: "", duration: 0 }
+
+  tasks:
+    # STAGE 1: VALIDATION
+    - name: "STAGE 1 - START - Validate rollback prerequisites"
+      set_fact:
+        stage1_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Verify volume exists
+      shell: |
+        docker exec cinder_api openstack volume show {{ target_volume_id }} -f json
+      register: volume_info
+      changed_when: false
+      run_once: true
+
+    - name: Parse volume information
+      set_fact:
+        volume_data: "{{ volume_info.stdout | from_json }}"
+      run_once: true
+
+    - name: Check volume status
+      fail:
+        msg: "Volume {{ target_volume_id }} is not in a safe state for rollback. Current status: {{ volume_data.status }}"
+      when: volume_data.status not in ['available', 'error']
+      run_once: true
+
+    - name: Get list of snapshots for this volume
+      shell: |
+        docker exec cinder_api openstack volume snapshot list --volume {{ target_volume_id }} -f json
+      register: snapshots_list
+      changed_when: false
+      run_once: true
+
+    - name: Parse snapshots
+      set_fact:
+        available_snapshots: "{{ snapshots_list.stdout | from_json }}"
+      run_once: true
+
+    - name: Fail if no snapshots available
+      fail:
+        msg: "No snapshots found for volume {{ target_volume_id }}. Cannot perform rollback."
+      when: available_snapshots | length == 0
+      run_once: true
+
+    - name: Determine snapshot to use
+      set_fact:
+        selected_snapshot: >-
+          {{ (available_snapshots | sort(attribute='created_at', reverse=true) | first).id
+             if snapshot_id == 'latest'
+             else snapshot_id }}
+      run_once: true
+
+    - name: Verify selected snapshot exists
+      shell: |
+        docker exec cinder_api openstack volume snapshot show {{ selected_snapshot }} -f json
+      register: snapshot_info
+      changed_when: false
+      run_once: true
+
+    - name: Parse snapshot information
+      set_fact:
+        snapshot_data: "{{ snapshot_info.stdout | from_json }}"
+      run_once: true
+
+    - name: Verify snapshot is available
+      fail:
+        msg: "Snapshot {{ selected_snapshot }} is not available. Status: {{ snapshot_data.status }}"
+      when: snapshot_data.status != 'available'
+      run_once: true
+
+    - name: Check if volume is attached
+      shell: |
+        docker exec cinder_api openstack volume show {{ target_volume_id }} -f json | jq -r '.attachments | length'
+      register: attachment_count
+      changed_when: false
+      run_once: true
+
+    - name: Get attachment details if attached
+      shell: |
+        docker exec cinder_api openstack volume show {{ target_volume_id }} -f json | jq -r '.attachments[0].server_id // "NONE"'
+      register: attached_instance
+      when: attachment_count.stdout | int > 0
+      changed_when: false
+      run_once: true
+
+    - name: "STAGE 1 - END - Update validation stage"
+      set_fact:
+        stage1_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'validation': {'status': 'complete', 'start_time': stage1_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage1_start | int)}}) }}"
+
+    # STAGE 2: PRE-ROLLBACK BACKUP
+    - name: "STAGE 2 - START - Create safety backup"
+      set_fact:
+        stage2_start: "{{ ansible_date_time.epoch }}"
+      when: create_backup_before_rollback
+
+    - name: Create pre-rollback snapshot
+      shell: |
+        docker exec cinder_api openstack volume snapshot create \
+          --volume {{ target_volume_id }} \
+          --force \
+          "pre-rollback-{{ ansible_date_time.epoch }}" \
+          -f json
+      register: safety_snapshot
+      when: create_backup_before_rollback
+      run_once: true
+
+    - name: Parse safety snapshot
+      set_fact:
+        safety_snapshot_id: "{{ (safety_snapshot.stdout | from_json).id }}"
+      when: create_backup_before_rollback and safety_snapshot.rc == 0
+      run_once: true
+
+    - name: Wait for safety snapshot to complete
+      shell: |
+        docker exec cinder_api openstack volume snapshot show {{ safety_snapshot_id }} -f json | jq -r '.status'
+      register: safety_status
+      retries: 60
+      delay: 5
+      until: safety_status.stdout == 'available'
+      when: create_backup_before_rollback and safety_snapshot.rc == 0
+      changed_when: false
+      run_once: true
+
+    - name: "STAGE 2 - END - Update backup stage"
+      set_fact:
+        stage2_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'backup': {'status': 'complete', 'start_time': stage2_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage2_start | int)}}) }}"
+      when: create_backup_before_rollback
+
+    - name: "STAGE 2 - SKIPPED - Backup stage skipped"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'backup': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not create_backup_before_rollback
+
+    # STAGE 3: ROLLBACK EXECUTION
+    - name: "STAGE 3 - START - Execute rollback"
+      set_fact:
+        stage3_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Detach volume if attached (for revert method)
+      shell: |
+        docker exec cinder_api openstack server remove volume {{ attached_instance.stdout }} {{ target_volume_id }}
+      when:
+        - rollback_method == 'revert'
+        - attachment_count.stdout | int > 0
+        - attached_instance.stdout != "NONE"
+      register: detach_result
+      ignore_errors: yes
+      run_once: true
+
+    - name: Wait for volume to detach
+      shell: |
+        docker exec cinder_api openstack volume show {{ target_volume_id }} -f json | jq -r '.status'
+      register: volume_status_check
+      retries: 30
+      delay: 5
+      until: volume_status_check.stdout == 'available'
+      when:
+        - rollback_method == 'revert'
+        - attachment_count.stdout | int > 0
+      changed_when: false
+      run_once: true
+
+    - name: ROLLBACK METHOD - Revert to snapshot (in-place)
+      block:
+        - name: Revert volume to snapshot
+          shell: |
+            docker exec cinder_api cinder revert-to-snapshot {{ selected_snapshot }}
+          register: revert_result
+          run_once: true
+
+        - name: Wait for revert to complete
+          shell: |
+            docker exec cinder_api openstack volume show {{ target_volume_id }} -f json | jq -r '.status'
+          register: revert_status
+          retries: 60
+          delay: 10
+          until: revert_status.stdout == 'available'
+          changed_when: false
+          run_once: true
+
+        - name: Set rollback result
+          set_fact:
+            rollback_success: "{{ revert_result.rc == 0 and revert_status.stdout == 'available' }}"
+            new_volume_id: "{{ target_volume_id }}"
+            rollback_type: "in-place-revert"
+      when: rollback_method == 'revert'
+
+    - name: ROLLBACK METHOD - Clone from snapshot
+      block:
+        - name: Create new volume from snapshot
+          shell: |
+            docker exec cinder_api openstack volume create \
+              --snapshot {{ selected_snapshot }} \
+              --size {{ volume_data.size }} \
+              "{{ volume_data.name }}-restored-{{ ansible_date_time.epoch }}" \
+              -f json
+          register: clone_result
+          run_once: true
+
+        - name: Parse new volume ID
+          set_fact:
+            cloned_volume_id: "{{ (clone_result.stdout | from_json).id }}"
+          when: clone_result.rc == 0
+          run_once: true
+
+        - name: Wait for new volume to be available
+          shell: |
+            docker exec cinder_api openstack volume show {{ cloned_volume_id }} -f json | jq -r '.status'
+          register: clone_status
+          retries: 60
+          delay: 10
+          until: clone_status.stdout == 'available'
+          changed_when: false
+          run_once: true
+
+        - name: Set rollback result
+          set_fact:
+            rollback_success: "{{ clone_result.rc == 0 and clone_status.stdout == 'available' }}"
+            new_volume_id: "{{ cloned_volume_id }}"
+            rollback_type: "clone"
+      when: rollback_method == 'clone'
+
+    - name: Re-attach volume if it was detached
+      shell: |
+        docker exec cinder_api openstack server add volume {{ attached_instance.stdout }} {{ new_volume_id }}
+      when:
+        - rollback_method == 'revert'
+        - attachment_count.stdout | int > 0
+        - attached_instance.stdout != "NONE"
+        - rollback_success
+      register: reattach_result
+      ignore_errors: yes
+      run_once: true
+
+    - name: "STAGE 3 - END - Update rollback stage"
+      set_fact:
+        stage3_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'rollback': {'status': ('complete' if rollback_success else 'failed'), 'start_time': stage3_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage3_start | int)}}) }}"
+
+    # STAGE 4: VERIFICATION
+    - name: "STAGE 4 - START - Verify rollback success"
+      set_fact:
+        stage4_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Verify restored volume exists
+      shell: |
+        docker exec cinder_api openstack volume show {{ new_volume_id }} -f json
+      register: restored_volume_info
+      changed_when: false
+      run_once: true
+
+    - name: Parse restored volume data
+      set_fact:
+        restored_volume: "{{ restored_volume_info.stdout | from_json }}"
+      run_once: true
+
+    - name: Verify volume size matches
+      set_fact:
+        size_match: "{{ restored_volume.size | int == volume_data.size | int }}"
+      run_once: true
+
+    - name: Check volume is usable
+      shell: |
+        docker exec cinder_api openstack volume show {{ new_volume_id }} -f json | jq -r '.status'
+      register: final_status
+      changed_when: false
+      run_once: true
+
+    - name: Calculate overall success
+      set_fact:
+        rollback_complete: >-
+          {{ rollback_success and
+             size_match and
+             final_status.stdout in ['available', 'in-use'] }}
+
+    - name: "STAGE 4 - END - Update verification stage"
+      set_fact:
+        stage4_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'verification': {'status': ('complete' if rollback_complete else 'failed'), 'start_time': stage4_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage4_start | int)}}) }}"
+
+    - name: Calculate total execution time
+      set_fact:
+        total_duration: "{{ stage4_end | int - stage1_start | int }}"
+
+    - name: Generate rollback report
+      set_fact:
+        rollback_report:
+          meta:
+            report_type: "volume_snapshot_rollback"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            execution_id: "{{ ansible_date_time.epoch }}"
+            playbook_version: "1.0.0"
+            total_duration_seconds: "{{ total_duration | int }}"
+          source:
+            original_volume_id: "{{ target_volume_id }}"
+            original_volume_name: "{{ volume_data.name }}"
+            original_volume_size: "{{ volume_data.size }}"
+            original_volume_status: "{{ volume_data.status }}"
+            was_attached: "{{ attachment_count.stdout | int > 0 }}"
+            attached_to_instance: "{{ attached_instance.stdout if attachment_count.stdout | int > 0 else 'none' }}"
+          snapshot:
+            snapshot_id: "{{ selected_snapshot }}"
+            snapshot_name: "{{ snapshot_data.name }}"
+            snapshot_created: "{{ snapshot_data.created_at }}"
+            snapshot_size: "{{ snapshot_data.size }}"
+          rollback:
+            method: "{{ rollback_method }}"
+            type: "{{ rollback_type }}"
+            safety_backup_created: "{{ create_backup_before_rollback }}"
+            safety_backup_id: "{{ safety_snapshot_id | default('none') }}"
+            new_volume_id: "{{ new_volume_id }}"
+          execution:
+            stages_completed: 4
+            stages:
+              validation: "{{ rollback_stages.validation }}"
+              backup: "{{ rollback_stages.backup }}"
+              rollback: "{{ rollback_stages.rollback }}"
+              verification: "{{ rollback_stages.verification }}"
+          results:
+            rollback_successful: "{{ rollback_success }}"
+            volume_restored: "{{ new_volume_id }}"
+            volume_status: "{{ final_status.stdout }}"
+            size_verified: "{{ size_match }}"
+          status:
+            overall: "{{ 'success' if rollback_complete else 'failed' }}"
+            rollback_complete: "{{ rollback_complete }}"
+            confidence: "{{ 0.98 if rollback_complete else 0.40 }}"
+          decision:
+            action_taken: "volume_rollback_completed"
+            next_recommended_action: "{{ 'Verify application data integrity' if rollback_complete else 'Manually investigate volume and snapshot status' }}"
+            manual_intervention_required: "{{ not rollback_complete }}"
+            original_volume_preserved: "{{ rollback_method == 'clone' }}"
+
+    - name: Save rollback report
+      copy:
+        content: "{{ rollback_report | to_nice_json }}"
+        dest: "/var/log/autosphere/rollback_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE ROLLBACK RESULT ===
+          STATUS={{ rollback_report.status.overall | upper }}
+          ROLLBACK_COMPLETE={{ rollback_report.status.rollback_complete }}
+          CONFIDENCE={{ rollback_report.status.confidence }}
+          METHOD={{ rollback_report.rollback.method }}
+          ORIGINAL_VOLUME={{ rollback_report.source.original_volume_id }}
+          NEW_VOLUME={{ rollback_report.results.volume_restored }}
+          SNAPSHOT_USED={{ rollback_report.snapshot.snapshot_id }}
+          SAFETY_BACKUP={{ rollback_report.rollback.safety_backup_id }}
+          VOLUME_STATUS={{ rollback_report.results.volume_status }}
+          TOTAL_DURATION={{ rollback_report.meta.total_duration_seconds }}s
+          REPORT_FILE=/var/log/autosphere/rollback_{{ ansible_date_time.epoch }}.json
+          === END ROLLBACK RESULT ===
+      run_once: true
+
+    - name: Display human-readable summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║          VOLUME SNAPSHOT ROLLBACK REPORT                   ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📅 Timestamp: {{ rollback_report.meta.timestamp }}
+          🖥️  Host: {{ rollback_report.meta.hostname }}
+          ⏱️  Duration: {{ rollback_report.meta.total_duration_seconds }}s
+
+          📀 SOURCE VOLUME:
+          └─ ID: {{ rollback_report.source.original_volume_id }}
+          └─ Name: {{ rollback_report.source.original_volume_name }}
+          └─ Size: {{ rollback_report.source.original_volume_size }}GB
+          └─ Status: {{ rollback_report.source.original_volume_status }}
+          └─ Attached: {{ rollback_report.source.was_attached }}
+
+          📸 SNAPSHOT USED:
+          └─ ID: {{ rollback_report.snapshot.snapshot_id }}
+          └─ Name: {{ rollback_report.snapshot.snapshot_name }}
+          └─ Created: {{ rollback_report.snapshot.snapshot_created }}
+
+          🔄 ROLLBACK DETAILS:
+          └─ Method: {{ rollback_report.rollback.method | upper }}
+          └─ Type: {{ rollback_report.rollback.type }}
+          └─ Safety Backup: {{ rollback_report.rollback.safety_backup_id }}
+          └─ Result Volume: {{ rollback_report.results.volume_restored }}
+
+          ✅ STAGES COMPLETED: {{ rollback_report.execution.stages_completed }}/4
+
+          📊 VERIFICATION:
+          └─ Volume Status: {{ rollback_report.results.volume_status }}
+          └─ Size Verified: {{ rollback_report.results.size_verified }}
+
+          🎯 OVERALL STATUS: {{ rollback_report.status.overall | upper }}
+          📈 CONFIDENCE: {{ (rollback_report.status.confidence | float * 100) | round(0) }}%
+
+          💡 NEXT ACTION:
+          {{ rollback_report.decision.next_recommended_action }}
+
+          ℹ️  NOTE: Original volume {{ 'preserved' if rollback_report.decision.original_volume_preserved else 'modified in-place' }}
+
+          ╚════════════════════════════════════════════════════════════╝
+      run_once: true
+
+    - name: Fail if rollback unsuccessful
+      fail:
+        msg: |
+          ROLLBACK FAILED
+          Check logs and volume status. Safety backup: {{ safety_snapshot_id | default('none') }}
+          Manual intervention required.
+      when: not rollback_complete

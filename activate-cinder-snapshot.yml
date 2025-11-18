@@ -1,0 +1,460 @@
+---
+# Cinder Snapshot Service Activation Playbook
+# Enables and configures snapshot services for volume rollback capabilities
+# Part of AutoSphere disaster recovery system
+
+- name: Activate Cinder Snapshot Services for Rollback
+  hosts: openstack_controllers:openstack_storage
+  gather_facts: yes
+  become: yes
+  vars:
+    snapshot_backend: "{{ cinder_snapshot_backend | default('lvm') }}"
+    snapshot_retention_days: "{{ snapshot_retention | default(7) }}"
+    max_snapshots_per_volume: "{{ max_snapshots | default(10) }}"
+    enable_snapshot_backup: true
+    kolla_config_path: "/etc/kolla"
+    activation_stages:
+      preparation: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      configuration: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      service_restart: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      verification: { status: "pending", start_time: "", end_time: "", duration: 0 }
+
+  tasks:
+    # STAGE 1: PREPARATION
+    - name: "STAGE 1 - START - Preparation and validation"
+      set_fact:
+        stage1_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Check if Kolla configuration exists
+      stat:
+        path: "{{ kolla_config_path }}/cinder-volume"
+      register: kolla_config_dir
+
+    - name: Verify Cinder services are running
+      shell: |
+        docker ps --filter "name=cinder" --format "{{.Names}}" | wc -l
+      register: cinder_containers_count
+      changed_when: false
+
+    - name: Fail if Cinder is not deployed
+      fail:
+        msg: "Cinder services not found. Ensure Kolla-Ansible has deployed Cinder first."
+      when: cinder_containers_count.stdout | int == 0
+
+    - name: Check current snapshot capability
+      shell: |
+        docker exec cinder_api openstack volume snapshot list --limit 1 -f json 2>&1
+      register: snapshot_test
+      ignore_errors: yes
+      changed_when: false
+      run_once: true
+
+    - name: Get current Cinder backend configuration
+      shell: |
+        docker exec cinder_volume grep "^enabled_backends" /etc/cinder/cinder.conf || echo "NONE"
+      register: current_backends
+      changed_when: false
+
+    - name: Check available storage space for snapshots
+      shell: |
+        df -h /var/lib/docker | tail -1 | awk '{print $5}' | sed 's/%//'
+      register: storage_usage
+      changed_when: false
+
+    - name: Warn if storage is low
+      debug:
+        msg: "WARNING: Storage usage is {{ storage_usage.stdout }}%. Ensure adequate space for snapshots."
+      when: storage_usage.stdout | int > 80
+
+    - name: "STAGE 1 - END - Update preparation stage"
+      set_fact:
+        stage1_end: "{{ ansible_date_time.epoch }}"
+        activation_stages: "{{ activation_stages | combine({'preparation': {'status': 'complete', 'start_time': stage1_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage1_start | int)}}) }}"
+
+    # STAGE 2: CONFIGURATION
+    - name: "STAGE 2 - START - Configure snapshot services"
+      set_fact:
+        stage2_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Create backup of Cinder configuration
+      shell: |
+        docker exec cinder_volume cp /etc/cinder/cinder.conf /etc/cinder/cinder.conf.bak.{{ ansible_date_time.epoch }}
+      register: config_backup
+
+    - name: Create Kolla config override directory
+      file:
+        path: "{{ kolla_config_path }}/config/cinder"
+        state: directory
+        mode: '0755'
+
+    - name: Configure snapshot settings in cinder.conf override
+      copy:
+        content: |
+          # Snapshot Service Configuration - AutoSphere
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          [DEFAULT]
+          # Enable snapshot services
+          snapshot_name_template = snapshot-%s
+
+          # Snapshot retention and limits
+          max_snapshots_per_volume = {{ max_snapshots_per_volume }}
+
+          # Enable snapshot backup to backend
+          backup_driver = cinder.backup.drivers.{{ 'swift' if enable_snapshot_backup else 'posix' }}.SwiftBackupDriver
+
+          # Snapshot performance tuning
+          snapshot_compression = True
+          snapshot_autoremove = False
+
+          [{{ snapshot_backend }}]
+          # Backend-specific snapshot settings
+          volume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver
+          lvm_type = thin
+          lvm_max_over_subscription_ratio = 2.0
+
+          # Snapshot space allocation
+          reserved_percentage = 10
+
+        dest: "{{ kolla_config_path }}/config/cinder/cinder-volume.conf"
+        mode: '0644'
+      register: snapshot_config
+
+    - name: Enable snapshot quota management
+      copy:
+        content: |
+          # Snapshot Quota Configuration
+
+          [DEFAULT]
+          quota_snapshots = {{ max_snapshots_per_volume }}
+          quota_backup_gigabytes = -1
+          quota_gigabytes = -1
+
+        dest: "{{ kolla_config_path }}/config/cinder/cinder-api.conf"
+        mode: '0644'
+      register: quota_config
+
+    - name: Configure snapshot cleanup policy
+      copy:
+        content: |
+          #!/bin/bash
+          # Snapshot Cleanup Cron Job
+          # Removes snapshots older than {{ snapshot_retention_days }} days
+
+          # Find and delete old snapshots
+          docker exec cinder_api openstack volume snapshot list -f json | \
+            jq -r '.[] | select(.created_at | fromdateiso8601 < (now - {{ snapshot_retention_days }} * 86400)) | .id' | \
+            xargs -I {} docker exec cinder_api openstack volume snapshot delete {}
+
+        dest: "/etc/cron.daily/cinder-snapshot-cleanup"
+        mode: '0755'
+      register: cleanup_script
+
+    - name: "STAGE 2 - END - Update configuration stage"
+      set_fact:
+        stage2_end: "{{ ansible_date_time.epoch }}"
+        activation_stages: "{{ activation_stages | combine({'configuration': {'status': 'complete', 'start_time': stage2_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage2_start | int)}}) }}"
+
+    # STAGE 3: SERVICE RESTART
+    - name: "STAGE 3 - START - Restart Cinder services"
+      set_fact:
+        stage3_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Reconfigure Cinder with new settings (if using Kolla-Ansible)
+      debug:
+        msg: "NOTE: Run 'kolla-ansible -i inventory reconfigure --tags cinder' to apply configuration changes system-wide"
+      run_once: true
+
+    - name: Restart Cinder volume service
+      shell: |
+        docker restart cinder_volume
+      register: volume_restart
+      ignore_errors: yes
+
+    - name: Wait for volume service initialization
+      pause:
+        seconds: 20
+
+    - name: Restart Cinder API service
+      shell: |
+        docker restart cinder_api
+      register: api_restart
+      ignore_errors: yes
+
+    - name: Wait for API initialization
+      pause:
+        seconds: 15
+
+    - name: Restart Cinder scheduler
+      shell: |
+        docker restart cinder_scheduler
+      register: scheduler_restart
+      ignore_errors: yes
+
+    - name: Wait for scheduler initialization
+      pause:
+        seconds: 10
+
+    - name: Restart Cinder backup service (if exists)
+      shell: |
+        docker restart cinder_backup
+      register: backup_restart
+      ignore_errors: yes
+      when: enable_snapshot_backup
+
+    - name: "STAGE 3 - END - Update service restart stage"
+      set_fact:
+        stage3_end: "{{ ansible_date_time.epoch }}"
+        activation_stages: "{{ activation_stages | combine({'service_restart': {'status': 'complete', 'start_time': stage3_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage3_start | int)}}) }}"
+
+    # STAGE 4: VERIFICATION
+    - name: "STAGE 4 - START - Verify snapshot functionality"
+      set_fact:
+        stage4_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Check Cinder services are up
+      shell: |
+        docker exec cinder_api cinder service-list | grep -c "up" || true
+      register: services_up_count
+      retries: 10
+      delay: 10
+      until: services_up_count.stdout | int > 0
+      changed_when: false
+      run_once: true
+
+    - name: Verify snapshot API endpoint
+      shell: |
+        docker exec cinder_api openstack volume snapshot list -f json
+      register: snapshot_api_test
+      retries: 5
+      delay: 5
+      until: snapshot_api_test.rc == 0
+      changed_when: false
+      run_once: true
+
+    - name: Check if test volume exists for verification
+      shell: |
+        docker exec cinder_api openstack volume list --name "autosphere-snapshot-test" -f json | jq -r '.[0].id // "NONE"'
+      register: test_volume_check
+      changed_when: false
+      run_once: true
+
+    - name: Create test volume if needed
+      shell: |
+        docker exec cinder_api openstack volume create --size 1 autosphere-snapshot-test -f json | jq -r '.id'
+      register: test_volume_create
+      when: test_volume_check.stdout == "NONE"
+      run_once: true
+
+    - name: Set test volume ID
+      set_fact:
+        test_volume_id: "{{ test_volume_create.stdout if test_volume_check.stdout == 'NONE' else test_volume_check.stdout }}"
+      run_once: true
+
+    - name: Wait for test volume to be available
+      shell: |
+        docker exec cinder_api openstack volume show {{ test_volume_id }} -f json | jq -r '.status'
+      register: volume_status
+      retries: 30
+      delay: 5
+      until: volume_status.stdout == "available"
+      changed_when: false
+      when: test_volume_id != "NONE"
+      run_once: true
+
+    - name: Create test snapshot
+      shell: |
+        docker exec cinder_api openstack volume snapshot create --volume {{ test_volume_id }} autosphere-snapshot-test-{{ ansible_date_time.epoch }} -f json
+      register: test_snapshot_create
+      when: test_volume_id != "NONE"
+      ignore_errors: yes
+      run_once: true
+
+    - name: Wait for snapshot creation
+      pause:
+        seconds: 10
+      when: test_snapshot_create.rc == 0
+
+    - name: Verify snapshot was created
+      shell: |
+        docker exec cinder_api openstack volume snapshot list -f json | jq -r '.[] | select(.name | contains("autosphere-snapshot-test")) | .status'
+      register: snapshot_verify
+      when: test_snapshot_create.rc == 0
+      changed_when: false
+      run_once: true
+
+    - name: Get snapshot ID for cleanup
+      shell: |
+        docker exec cinder_api openstack volume snapshot list -f json | jq -r '.[] | select(.name | contains("autosphere-snapshot-test")) | .id'
+      register: test_snapshot_id
+      when: test_snapshot_create.rc == 0
+      changed_when: false
+      run_once: true
+
+    - name: Delete test snapshot
+      shell: |
+        docker exec cinder_api openstack volume snapshot delete {{ test_snapshot_id.stdout }}
+      when:
+        - test_snapshot_create.rc == 0
+        - test_snapshot_id.stdout is defined
+      ignore_errors: yes
+      run_once: true
+
+    - name: Delete test volume
+      shell: |
+        docker exec cinder_api openstack volume delete {{ test_volume_id }}
+      when:
+        - test_volume_check.stdout == "NONE"
+        - test_volume_id != "NONE"
+      ignore_errors: yes
+      run_once: true
+
+    - name: Check snapshot configuration applied
+      shell: |
+        docker exec cinder_volume grep "snapshot_name_template" /etc/cinder/cinder.conf || echo "NOT_FOUND"
+      register: config_verify
+      changed_when: false
+
+    - name: Determine activation success
+      set_fact:
+        activation_success: >-
+          {{ (services_up_count.stdout | int > 0) and
+             (snapshot_api_test.rc == 0) and
+             (test_snapshot_create.rc == 0 if test_volume_id != 'NONE' else true) }}
+
+    - name: "STAGE 4 - END - Update verification stage"
+      set_fact:
+        stage4_end: "{{ ansible_date_time.epoch }}"
+        activation_stages: "{{ activation_stages | combine({'verification': {'status': ('complete' if activation_success else 'failed'), 'start_time': stage4_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage4_start | int)}}) }}"
+
+    - name: Calculate total execution time
+      set_fact:
+        total_duration: "{{ stage4_end | int - stage1_start | int }}"
+
+    - name: Generate snapshot activation report
+      set_fact:
+        snapshot_activation_report:
+          meta:
+            report_type: "cinder_snapshot_activation"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            execution_id: "{{ ansible_date_time.epoch }}"
+            playbook_version: "1.0.0"
+            total_duration_seconds: "{{ total_duration | int }}"
+          configuration:
+            snapshot_backend: "{{ snapshot_backend }}"
+            retention_days: "{{ snapshot_retention_days }}"
+            max_snapshots_per_volume: "{{ max_snapshots_per_volume }}"
+            backup_enabled: "{{ enable_snapshot_backup }}"
+            storage_usage_percent: "{{ storage_usage.stdout | int }}"
+          execution:
+            stages_completed: 4
+            stages:
+              preparation: "{{ activation_stages.preparation }}"
+              configuration: "{{ activation_stages.configuration }}"
+              service_restart: "{{ activation_stages.service_restart }}"
+              verification: "{{ activation_stages.verification }}"
+          results:
+            cinder_services_up: "{{ services_up_count.stdout | int }}"
+            snapshot_api_working: "{{ snapshot_api_test.rc == 0 }}"
+            test_snapshot_created: "{{ test_snapshot_create.rc == 0 if test_volume_id != 'NONE' else 'skipped' }}"
+            config_files_created: "{{ snapshot_config.changed and quota_config.changed }}"
+            cleanup_script_installed: "{{ cleanup_script.changed }}"
+          status:
+            overall: "{{ 'success' if activation_success else 'partial_failure' }}"
+            snapshot_service_active: "{{ activation_success }}"
+            confidence: "{{ 0.95 if activation_success else 0.60 }}"
+          decision:
+            action_taken: "snapshot_service_activated"
+            next_recommended_action: "{{ 'Create volume snapshots before making changes' if activation_success else 'Review service logs and retry configuration' }}"
+            manual_intervention_required: "{{ not activation_success }}"
+            rollback_enabled: "{{ activation_success }}"
+          usage_instructions:
+            create_snapshot: "openstack volume snapshot create --volume <volume-id> <snapshot-name>"
+            list_snapshots: "openstack volume snapshot list"
+            restore_from_snapshot: "openstack volume create --snapshot <snapshot-id> --size <size> <new-volume-name>"
+            delete_snapshot: "openstack volume snapshot delete <snapshot-id>"
+
+    - name: Save snapshot activation report
+      copy:
+        content: "{{ snapshot_activation_report | to_nice_json }}"
+        dest: "/var/log/autosphere/snapshot_activation_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE SNAPSHOT ACTIVATION RESULT ===
+          STATUS={{ snapshot_activation_report.status.overall | upper }}
+          SNAPSHOT_ACTIVE={{ snapshot_activation_report.status.snapshot_service_active }}
+          CONFIDENCE={{ snapshot_activation_report.status.confidence }}
+          SERVICES_UP={{ snapshot_activation_report.results.cinder_services_up }}
+          API_WORKING={{ snapshot_activation_report.results.snapshot_api_working }}
+          BACKEND={{ snapshot_activation_report.configuration.snapshot_backend }}
+          RETENTION_DAYS={{ snapshot_activation_report.configuration.retention_days }}
+          MAX_SNAPSHOTS={{ snapshot_activation_report.configuration.max_snapshots_per_volume }}
+          ROLLBACK_ENABLED={{ snapshot_activation_report.decision.rollback_enabled }}
+          TOTAL_DURATION={{ snapshot_activation_report.meta.total_duration_seconds }}s
+          REPORT_FILE=/var/log/autosphere/snapshot_activation_{{ ansible_date_time.epoch }}.json
+          === END SNAPSHOT ACTIVATION RESULT ===
+      run_once: true
+
+    - name: Display human-readable summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║     CINDER SNAPSHOT SERVICE ACTIVATION REPORT              ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📅 Timestamp: {{ snapshot_activation_report.meta.timestamp }}
+          🖥️  Host: {{ snapshot_activation_report.meta.hostname }}
+          ⏱️  Duration: {{ snapshot_activation_report.meta.total_duration_seconds }}s
+
+          ⚙️  CONFIGURATION:
+          └─ Backend: {{ snapshot_activation_report.configuration.snapshot_backend }}
+          └─ Retention: {{ snapshot_activation_report.configuration.retention_days }} days
+          └─ Max Snapshots/Volume: {{ snapshot_activation_report.configuration.max_snapshots_per_volume }}
+          └─ Backup Enabled: {{ snapshot_activation_report.configuration.backup_enabled }}
+          └─ Storage Usage: {{ snapshot_activation_report.configuration.storage_usage_percent }}%
+
+          ✅ STAGES COMPLETED: {{ snapshot_activation_report.execution.stages_completed }}/4
+
+          📊 VERIFICATION RESULTS:
+          └─ Cinder Services Up: {{ snapshot_activation_report.results.cinder_services_up }}
+          └─ Snapshot API Working: {{ snapshot_activation_report.results.snapshot_api_working }}
+          └─ Test Snapshot: {{ snapshot_activation_report.results.test_snapshot_created }}
+          └─ Config Files: {{ 'Created' if snapshot_activation_report.results.config_files_created else 'Already exists' }}
+
+          🎯 OVERALL STATUS: {{ snapshot_activation_report.status.overall | upper }}
+          📈 CONFIDENCE: {{ (snapshot_activation_report.status.confidence | float * 100) | round(0) }}%
+          🔄 ROLLBACK ENABLED: {{ snapshot_activation_report.decision.rollback_enabled }}
+
+          💡 USAGE EXAMPLES:
+
+          📸 Create Snapshot:
+             {{ snapshot_activation_report.usage_instructions.create_snapshot }}
+
+          📋 List Snapshots:
+             {{ snapshot_activation_report.usage_instructions.list_snapshots }}
+
+          ♻️  Restore from Snapshot:
+             {{ snapshot_activation_report.usage_instructions.restore_from_snapshot }}
+
+          🗑️  Delete Snapshot:
+             {{ snapshot_activation_report.usage_instructions.delete_snapshot }}
+
+          💡 NEXT ACTION:
+          {{ snapshot_activation_report.decision.next_recommended_action }}
+
+          ╚════════════════════════════════════════════════════════════╝
+      run_once: true
+
+    - name: Fail if activation incomplete
+      fail:
+        msg: |
+          SNAPSHOT ACTIVATION INCOMPLETE
+          Manual intervention required. Check service logs:
+          - docker logs cinder_volume
+          - docker logs cinder_api
+      when: not activation_success

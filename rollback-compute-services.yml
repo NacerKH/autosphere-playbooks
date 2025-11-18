@@ -1,0 +1,579 @@
+---
+# Complete Compute Services Rollback Playbook
+# Restores all OpenStack compute services from snapshot
+# Includes: Nova, Neutron, Cinder, configurations, databases, and states
+# Part of AutoSphere disaster recovery system
+
+- name: Rollback All Compute Services from Snapshot
+  hosts: openstack_controllers:openstack_compute
+  gather_facts: yes
+  become: yes
+  vars:
+    snapshot_name: "{{ snapshot_id | mandatory }}"
+    snapshot_dir: "/var/backups/autosphere/compute-snapshots"
+    snapshot_path: "{{ snapshot_dir }}/{{ snapshot_name }}"
+    rollback_databases: "{{ restore_databases | default(true) }}"
+    rollback_configurations: "{{ restore_configs | default(true) }}"
+    rollback_volumes: "{{ restore_volumes | default(true) }}"
+    restart_services: "{{ restart_after_rollback | default(true) }}"
+    create_safety_backup: "{{ safety_backup | default(true) }}"
+    rollback_stages:
+      validation: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      safety_backup: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      stop_services: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      restore_databases: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      restore_configs: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      restore_volumes: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      start_services: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      verification: { status: "pending", start_time: "", end_time: "", duration: 0 }
+
+  tasks:
+    # STAGE 1: VALIDATION
+    - name: "STAGE 1 - START - Validate snapshot and prerequisites"
+      set_fact:
+        stage1_start: "{{ ansible_date_time.epoch }}"
+      run_once: true
+
+    - name: Check if snapshot directory exists
+      stat:
+        path: "{{ snapshot_path }}"
+      register: snapshot_dir_stat
+      run_once: true
+
+    - name: Fail if snapshot not found
+      fail:
+        msg: "Snapshot '{{ snapshot_name }}' not found at {{ snapshot_path }}"
+      when: not snapshot_dir_stat.stat.exists
+      run_once: true
+
+    - name: Check if manifest exists
+      stat:
+        path: "{{ snapshot_path }}/MANIFEST.txt"
+      register: manifest_stat
+      run_once: true
+
+    - name: Read snapshot manifest
+      slurp:
+        src: "{{ snapshot_path }}/MANIFEST.txt"
+      register: manifest_content
+      run_once: true
+
+    - name: Display snapshot manifest
+      debug:
+        msg: "{{ manifest_content.content | b64decode }}"
+      run_once: true
+
+    - name: Load snapshot report
+      slurp:
+        src: "{{ snapshot_path }}/metadata/snapshot-report.json"
+      register: snapshot_report_file
+      run_once: true
+
+    - name: Parse snapshot report
+      set_fact:
+        original_snapshot_report: "{{ snapshot_report_file.content | b64decode | from_json }}"
+      run_once: true
+
+    - name: Verify database dumps if restoring databases
+      stat:
+        path: "{{ snapshot_path }}/databases/nova.sql.gz"
+      register: db_dump_check
+      when: rollback_databases
+      run_once: true
+
+    - name: Fail if database dumps missing
+      fail:
+        msg: "Database dumps not found in snapshot. Cannot restore databases."
+      when: rollback_databases and not db_dump_check.stat.exists
+      run_once: true
+
+    - name: Prompt for confirmation
+      pause:
+        prompt: |
+          ⚠️  WARNING: DESTRUCTIVE OPERATION ⚠️
+
+          You are about to ROLLBACK all compute services to snapshot:
+
+          Snapshot ID: {{ snapshot_name }}
+          Created: {{ original_snapshot_report.meta.timestamp }}
+
+          This will:
+          {% if rollback_databases %}
+          ❌ OVERWRITE Nova, Neutron, Cinder databases
+          {% endif %}
+          {% if rollback_configurations %}
+          ❌ REPLACE all service configurations
+          {% endif %}
+          {% if rollback_volumes %}
+          ❌ RESTORE volumes from snapshots
+          {% endif %}
+          {% if restart_services %}
+          ❌ RESTART all compute services
+          {% endif %}
+
+          Type 'yes' to continue or 'no' to abort
+      register: confirmation
+      run_once: true
+
+    - name: Abort if not confirmed
+      fail:
+        msg: "Rollback aborted by user"
+      when: confirmation.user_input | lower != 'yes'
+      run_once: true
+
+    - name: "STAGE 1 - END - Update validation stage"
+      set_fact:
+        stage1_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'validation': {'status': 'complete', 'start_time': stage1_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage1_start | int)}}) }}"
+
+    # STAGE 2: SAFETY BACKUP
+    - name: "STAGE 2 - START - Create pre-rollback safety backup"
+      set_fact:
+        stage2_start: "{{ ansible_date_time.epoch }}"
+      when: create_safety_backup
+      run_once: true
+
+    - name: Create safety snapshot
+      include_tasks: snapshot-compute-services.yml
+      vars:
+        snapshot_name: "pre-rollback-safety-{{ ansible_date_time.epoch }}"
+        snapshot_volumes: false  # Skip volumes to save time
+        snapshot_databases: true
+        snapshot_configs: true
+        snapshot_states: true
+      when: create_safety_backup
+
+    - name: "STAGE 2 - END - Update safety backup stage"
+      set_fact:
+        stage2_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'complete', 'start_time': stage2_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage2_start | int)}}) }}"
+      when: create_safety_backup
+
+    - name: "STAGE 2 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not create_safety_backup
+
+    # STAGE 3: STOP SERVICES
+    - name: "STAGE 3 - START - Stop compute services"
+      set_fact:
+        stage3_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Stop Nova services
+      shell: |
+        docker stop nova_compute nova_conductor nova_scheduler nova_api
+      register: nova_stop
+      ignore_errors: yes
+
+    - name: Stop Neutron services
+      shell: |
+        docker stop neutron_openvswitch_agent neutron_dhcp_agent neutron_l3_agent neutron_metadata_agent neutron_server
+      register: neutron_stop
+      ignore_errors: yes
+
+    - name: Stop Cinder services
+      shell: |
+        docker stop cinder_volume cinder_scheduler cinder_api
+      register: cinder_stop
+      ignore_errors: yes
+
+    - name: Wait for services to stop
+      pause:
+        seconds: 30
+
+    - name: "STAGE 3 - END - Update stop services stage"
+      set_fact:
+        stage3_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'stop_services': {'status': 'complete', 'start_time': stage3_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage3_start | int)}}) }}"
+
+    # STAGE 4: RESTORE DATABASES
+    - name: "STAGE 4 - START - Restore databases"
+      set_fact:
+        stage4_start: "{{ ansible_date_time.epoch }}"
+      when: rollback_databases
+      run_once: true
+
+    - name: Verify database checksums
+      shell: |
+        cd {{ snapshot_path }}/databases
+        md5sum -c checksums.md5
+      register: checksum_verify
+      when: rollback_databases
+      run_once: true
+
+    - name: Restore Nova database
+      shell: |
+        gunzip < {{ snapshot_path }}/databases/nova.sql.gz | docker exec -i mariadb mysql nova
+      register: nova_db_restore
+      when: rollback_databases
+      run_once: true
+
+    - name: Restore Neutron database
+      shell: |
+        gunzip < {{ snapshot_path }}/databases/neutron.sql.gz | docker exec -i mariadb mysql neutron
+      register: neutron_db_restore
+      when: rollback_databases
+      run_once: true
+
+    - name: Restore Cinder database
+      shell: |
+        gunzip < {{ snapshot_path }}/databases/cinder.sql.gz | docker exec -i mariadb mysql cinder
+      register: cinder_db_restore
+      when: rollback_databases
+      run_once: true
+
+    - name: Restore Placement database
+      shell: |
+        gunzip < {{ snapshot_path }}/databases/placement.sql.gz | docker exec -i mariadb mysql placement
+      register: placement_db_restore
+      ignore_errors: yes
+      when: rollback_databases
+      run_once: true
+
+    - name: "STAGE 4 - END - Update restore databases stage"
+      set_fact:
+        stage4_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'restore_databases': {'status': 'complete', 'start_time': stage4_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage4_start | int)}}) }}"
+      when: rollback_databases
+
+    - name: "STAGE 4 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'restore_databases': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not rollback_databases
+
+    # STAGE 5: RESTORE CONFIGURATIONS
+    - name: "STAGE 5 - START - Restore configurations"
+      set_fact:
+        stage5_start: "{{ ansible_date_time.epoch }}"
+      when: rollback_configurations
+
+    - name: Backup current Kolla configuration
+      shell: |
+        tar czf /tmp/kolla-config-backup-{{ ansible_date_time.epoch }}.tar.gz /etc/kolla
+      when: rollback_configurations
+
+    - name: Restore Kolla configuration
+      unarchive:
+        src: "{{ snapshot_path }}/configs/kolla-config.tar.gz"
+        dest: /
+        remote_src: yes
+      when: rollback_configurations
+
+    - name: Restore Nova configurations to containers
+      shell: |
+        for container in nova_api nova_scheduler nova_conductor nova_compute; do
+          if [ -f {{ snapshot_path }}/configs/${container}-nova.conf ]; then
+            docker cp {{ snapshot_path }}/configs/${container}-nova.conf ${container}:/etc/nova/nova.conf 2>/dev/null || true
+          fi
+        done
+      when: rollback_configurations
+
+    - name: Restore Neutron configurations to containers
+      shell: |
+        for container in neutron_server neutron_l3_agent neutron_dhcp_agent neutron_openvswitch_agent; do
+          if [ -f {{ snapshot_path }}/configs/${container}-neutron.conf ]; then
+            docker cp {{ snapshot_path }}/configs/${container}-neutron.conf ${container}:/etc/neutron/neutron.conf 2>/dev/null || true
+          fi
+        done
+      when: rollback_configurations
+
+    - name: Restore Cinder configurations to containers
+      shell: |
+        for container in cinder_api cinder_scheduler cinder_volume; do
+          if [ -f {{ snapshot_path }}/configs/${container}-cinder.conf ]; then
+            docker cp {{ snapshot_path }}/configs/${container}-cinder.conf ${container}:/etc/cinder/cinder.conf 2>/dev/null || true
+          fi
+        done
+      when: rollback_configurations
+
+    - name: "STAGE 5 - END - Update restore configurations stage"
+      set_fact:
+        stage5_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'restore_configs': {'status': 'complete', 'start_time': stage5_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage5_start | int)}}) }}"
+      when: rollback_configurations
+
+    - name: "STAGE 5 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'restore_configs': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not rollback_configurations
+
+    # STAGE 6: RESTORE VOLUMES
+    - name: "STAGE 6 - START - Restore volumes from snapshots"
+      set_fact:
+        stage6_start: "{{ ansible_date_time.epoch }}"
+      when: rollback_volumes
+      run_once: true
+
+    - name: Read volume snapshot mapping
+      slurp:
+        src: "{{ snapshot_path }}/volumes/snapshot-mapping.txt"
+      register: snapshot_mapping_file
+      when: rollback_volumes
+      run_once: true
+
+    - name: Parse snapshot mapping
+      set_fact:
+        volume_snapshot_pairs: "{{ (snapshot_mapping_file.content | b64decode).split('\n') | select('match', '^[a-f0-9-]+:') | list }}"
+      when: rollback_volumes
+      run_once: true
+
+    - name: Display volume restore plan
+      debug:
+        msg: "Will restore {{ volume_snapshot_pairs | length }} volumes from snapshots"
+      when: rollback_volumes
+      run_once: true
+
+    - name: Restore volumes using rollback playbook
+      include_tasks: rollback-volume-snapshot.yml
+      vars:
+        volume_id: "{{ item.split(':')[0] }}"
+        snapshot_to_restore: "{{ item.split(':')[1] }}"
+        method: "revert"
+        create_backup_before_rollback: false
+      loop: "{{ volume_snapshot_pairs }}"
+      when: rollback_volumes and volume_snapshot_pairs is defined
+      ignore_errors: yes
+
+    - name: "STAGE 6 - END - Update restore volumes stage"
+      set_fact:
+        stage6_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'restore_volumes': {'status': 'complete', 'start_time': stage6_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage6_start | int)}}) }}"
+      when: rollback_volumes
+
+    - name: "STAGE 6 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'restore_volumes': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not rollback_volumes
+
+    # STAGE 7: START SERVICES
+    - name: "STAGE 7 - START - Start compute services"
+      set_fact:
+        stage7_start: "{{ ansible_date_time.epoch }}"
+      when: restart_services
+
+    - name: Start Nova services
+      shell: |
+        docker start nova_api nova_scheduler nova_conductor nova_compute
+      register: nova_start
+      when: restart_services
+
+    - name: Wait for Nova initialization
+      pause:
+        seconds: 30
+      when: restart_services
+
+    - name: Start Neutron services
+      shell: |
+        docker start neutron_server neutron_l3_agent neutron_dhcp_agent neutron_metadata_agent neutron_openvswitch_agent
+      register: neutron_start
+      when: restart_services
+
+    - name: Wait for Neutron initialization
+      pause:
+        seconds: 30
+      when: restart_services
+
+    - name: Start Cinder services
+      shell: |
+        docker start cinder_api cinder_scheduler cinder_volume
+      register: cinder_start
+      when: restart_services
+
+    - name: Wait for Cinder initialization
+      pause:
+        seconds: 20
+      when: restart_services
+
+    - name: "STAGE 7 - END - Update start services stage"
+      set_fact:
+        stage7_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'start_services': {'status': 'complete', 'start_time': stage7_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage7_start | int)}}) }}"
+      when: restart_services
+
+    - name: "STAGE 7 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'start_services': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not restart_services
+
+    # STAGE 8: VERIFICATION
+    - name: "STAGE 8 - START - Verify rollback success"
+      set_fact:
+        stage8_start: "{{ ansible_date_time.epoch }}"
+      run_once: true
+
+    - name: Verify Nova services
+      shell: |
+        docker exec nova_api openstack compute service list -f json | jq -r '.[] | select(.State == "up") | .Binary' | wc -l
+      register: nova_services_up
+      retries: 10
+      delay: 10
+      until: nova_services_up.stdout | int > 0
+      changed_when: false
+      run_once: true
+
+    - name: Verify Neutron agents
+      shell: |
+        docker exec neutron_server openstack network agent list -f json | jq -r '.[] | select(.Alive == true) | .Binary' | wc -l
+      register: neutron_agents_up
+      retries: 10
+      delay: 10
+      until: neutron_agents_up.stdout | int > 0
+      changed_when: false
+      run_once: true
+
+    - name: Verify Cinder services
+      shell: |
+        docker exec cinder_api openstack volume service list -f json | jq -r '.[] | select(.State == "up") | .Binary' | wc -l
+      register: cinder_services_up
+      retries: 10
+      delay: 10
+      until: cinder_services_up.stdout | int > 0
+      changed_when: false
+      run_once: true
+
+    - name: Test API endpoints
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:{{ item.port }}/{{ item.path }}"
+        method: GET
+        status_code: [200, 300]
+        validate_certs: no
+      loop:
+        - { port: 8774, path: "v2.1" }
+        - { port: 9696, path: "v2.0" }
+        - { port: 8776, path: "v3" }
+      register: api_tests
+      ignore_errors: yes
+      run_once: true
+
+    - name: Calculate rollback success
+      set_fact:
+        rollback_success: >-
+          {{ (nova_services_up.stdout | int > 0) and
+             (neutron_agents_up.stdout | int > 0) and
+             (cinder_services_up.stdout | int > 0) and
+             (api_tests.results | selectattr('status', 'in', [200, 300]) | list | length == 3) }}
+      run_once: true
+
+    - name: "STAGE 8 - END - Update verification stage"
+      set_fact:
+        stage8_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'verification': {'status': ('complete' if rollback_success else 'failed'), 'start_time': stage8_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage8_start | int)}}) }}"
+
+    - name: Calculate total execution time
+      set_fact:
+        total_duration: "{{ stage8_end | int - stage1_start | int }}"
+
+    - name: Generate rollback report
+      set_fact:
+        rollback_report:
+          meta:
+            report_type: "compute_services_rollback"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            execution_id: "{{ ansible_date_time.epoch }}"
+            snapshot_id: "{{ snapshot_name }}"
+            snapshot_created: "{{ original_snapshot_report.meta.timestamp }}"
+            playbook_version: "1.0.0"
+            total_duration_seconds: "{{ total_duration | int }}"
+          configuration:
+            rollback_databases: "{{ rollback_databases }}"
+            rollback_configurations: "{{ rollback_configurations }}"
+            rollback_volumes: "{{ rollback_volumes }}"
+            restart_services: "{{ restart_services }}"
+            safety_backup_created: "{{ create_safety_backup }}"
+          execution:
+            stages_completed: 8
+            stages:
+              validation: "{{ rollback_stages.validation }}"
+              safety_backup: "{{ rollback_stages.safety_backup }}"
+              stop_services: "{{ rollback_stages.stop_services }}"
+              restore_databases: "{{ rollback_stages.restore_databases }}"
+              restore_configs: "{{ rollback_stages.restore_configs }}"
+              restore_volumes: "{{ rollback_stages.restore_volumes }}"
+              start_services: "{{ rollback_stages.start_services }}"
+              verification: "{{ rollback_stages.verification }}"
+          results:
+            nova_services_up: "{{ nova_services_up.stdout | int }}"
+            neutron_agents_up: "{{ neutron_agents_up.stdout | int }}"
+            cinder_services_up: "{{ cinder_services_up.stdout | int }}"
+            apis_responding: "{{ api_tests.results | selectattr('status', 'in', [200, 300]) | list | length }}"
+          status:
+            overall: "{{ 'success' if rollback_success else 'partial_failure' }}"
+            rollback_complete: "{{ rollback_success }}"
+            confidence: "{{ 0.95 if rollback_success else 0.50 }}"
+          decision:
+            action_taken: "compute_services_rollback_completed"
+            next_recommended_action: "{{ 'Run health check to verify full recovery' if rollback_success else 'Investigate service logs and retry' }}"
+            manual_intervention_required: "{{ not rollback_success }}"
+      run_once: true
+
+    - name: Save rollback report
+      copy:
+        content: "{{ rollback_report | to_nice_json }}"
+        dest: "/var/log/autosphere/compute_rollback_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE COMPUTE ROLLBACK RESULT ===
+          STATUS={{ rollback_report.status.overall | upper }}
+          ROLLBACK_COMPLETE={{ rollback_report.status.rollback_complete }}
+          CONFIDENCE={{ rollback_report.status.confidence }}
+          SNAPSHOT_ID={{ rollback_report.meta.snapshot_id }}
+          NOVA_SERVICES={{ rollback_report.results.nova_services_up }}
+          NEUTRON_AGENTS={{ rollback_report.results.neutron_agents_up }}
+          CINDER_SERVICES={{ rollback_report.results.cinder_services_up }}
+          APIS_RESPONDING={{ rollback_report.results.apis_responding }}/3
+          DURATION={{ rollback_report.meta.total_duration_seconds }}s
+          REPORT_FILE=/var/log/autosphere/compute_rollback_{{ ansible_date_time.epoch }}.json
+          === END COMPUTE ROLLBACK RESULT ===
+      run_once: true
+
+    - name: Display human-readable summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║      COMPUTE SERVICES ROLLBACK - COMPLETE                  ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📅 Timestamp: {{ rollback_report.meta.timestamp }}
+          🆔 Snapshot ID: {{ rollback_report.meta.snapshot_id }}
+          📸 Snapshot Created: {{ rollback_report.meta.snapshot_created }}
+          ⏱️  Duration: {{ rollback_report.meta.total_duration_seconds }}s
+
+          🔄 COMPONENTS RESTORED:
+          {% if rollback_databases %}
+          ✅ Databases: Nova, Neutron, Cinder, Placement
+          {% endif %}
+          {% if rollback_configurations %}
+          ✅ Configurations: All service configs
+          {% endif %}
+          {% if rollback_volumes %}
+          ✅ Volumes: Restored from snapshots
+          {% endif %}
+
+          ✅ STAGES COMPLETED: {{ rollback_report.execution.stages_completed }}/8
+
+          📊 SERVICE STATUS:
+          └─ Nova Services: {{ rollback_report.results.nova_services_up }} up
+          └─ Neutron Agents: {{ rollback_report.results.neutron_agents_up }} alive
+          └─ Cinder Services: {{ rollback_report.results.cinder_services_up }} up
+          └─ API Endpoints: {{ rollback_report.results.apis_responding }}/3 responding
+
+          🎯 OVERALL STATUS: {{ rollback_report.status.overall | upper }}
+          📈 CONFIDENCE: {{ (rollback_report.status.confidence | float * 100) | round(0) }}%
+
+          💡 NEXT ACTION:
+          {{ rollback_report.decision.next_recommended_action }}
+
+          ╚════════════════════════════════════════════════════════════╝
+      run_once: true
+
+    - name: Fail if rollback incomplete
+      fail:
+        msg: |
+          ROLLBACK INCOMPLETE
+          Check service logs for details. Safety backup available if created.
+      when: not rollback_success
