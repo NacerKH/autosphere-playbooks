@@ -47,7 +47,7 @@
 
     - name: Check OpenStack service containers
       shell: |
-        docker ps --filter "name={{ item }}" --format "{{{{.Status}}}}"
+        docker ps --filter "name={{ item }}" --format "{% raw %}{{.Status}}{% endraw %}"
       register: container_status
       loop: "{{ critical_services }}"
       ignore_errors: yes
