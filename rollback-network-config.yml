@@ -1,0 +1,597 @@
+---
+# Network Configuration Rollback Playbook
+# Restores network configurations from backups
+# Part of AutoSphere disaster recovery system
+# Category: network
+
+- name: Rollback Network Configuration
+  hosts: "{{ target_host | default('all') }}"
+  gather_facts: yes
+  become: yes
+  vars:
+    # Rollback method selection (priority order)
+    rollback_method: "{{ method | default('auto') }}"  # auto, snapshot_restore, config_restore, playbook_rollback
+
+    # Snapshot restore parameters
+    snapshot_ids: "{{ network_snapshot_ids | default([]) }}"
+
+    # Config restore parameters
+    backup_paths: "{{ network_backup_paths | default([]) }}"
+    backup_dir: "/var/backups/autosphere/network"
+
+    # Network configuration targets
+    target_network_configs: "{{ network_configs | default(['interfaces', 'routing', 'dns', 'openvswitch', 'bridges']) }}"
+
+    # Safety options
+    create_safety_backup: "{{ safety_backup | default(true) }}"
+    verify_before_rollback: "{{ verify_rollback | default(true) }}"
+    restart_network_services: "{{ restart_after_rollback | default(true) }}"
+    test_connectivity: "{{ connectivity_test | default(true) }}"
+
+    # Network configuration paths
+    network_paths:
+      interfaces:
+        - /etc/network/interfaces
+        - /etc/network/interfaces.d/
+        - /etc/netplan/
+        - /etc/sysconfig/network-scripts/
+      routing:
+        - /etc/iproute2/
+        - /etc/quagga/
+        - /etc/frr/
+      dns:
+        - /etc/resolv.conf
+        - /etc/hosts
+        - /etc/hostname
+      openvswitch:
+        - /etc/openvswitch/
+        - /var/lib/openvswitch/
+      bridges:
+        - /etc/network/interfaces.d/br-*
+
+    # Test endpoints for connectivity verification
+    test_endpoints:
+      - 8.8.8.8
+      - 1.1.1.1
+
+    # Rollback stages tracking
+    rollback_stages:
+      validation: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      safety_backup: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      pre_check: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      rollback_execution: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      network_restart: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      verification: { status: "pending", start_time: "", end_time: "", duration: 0 }
+
+  tasks:
+    # STAGE 1: VALIDATION & METHOD SELECTION
+    - name: "STAGE 1 - START - Validation and method selection"
+      set_fact:
+        stage1_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Check if running as root
+      fail:
+        msg: "This playbook must be run with root privileges"
+      when: ansible_user_id != 'root' and ansible_env.SUDO_USER is not defined
+
+    - name: Verify backup directory exists
+      stat:
+        path: "{{ backup_dir }}"
+      register: backup_dir_stat
+
+    - name: Create backup directory if missing
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0750'
+      when: not backup_dir_stat.stat.exists
+
+    - name: Determine rollback method
+      set_fact:
+        selected_method: >-
+          {% if rollback_method == 'auto' %}
+            {% if snapshot_ids | length > 0 %}snapshot_restore
+            {% elif backup_paths | length > 0 %}config_restore
+            {% else %}playbook_rollback
+            {% endif %}
+          {% else %}{{ rollback_method }}
+          {% endif %}
+
+    - name: Validate snapshot_restore requirements
+      block:
+        - name: Check snapshot IDs provided
+          fail:
+            msg: "snapshot_restore method requires snapshot_ids parameter"
+          when: snapshot_ids | length == 0
+
+        - name: Verify snapshot archives exist
+          stat:
+            path: "{{ item }}"
+          register: snapshot_files
+          loop: "{{ snapshot_ids }}"
+          failed_when: not snapshot_files.results | map(attribute='stat.exists') | list | min
+      when: selected_method == 'snapshot_restore'
+
+    - name: Validate config_restore requirements
+      block:
+        - name: Check backup paths provided
+          fail:
+            msg: "config_restore method requires backup_paths parameter"
+          when: backup_paths | length == 0
+
+        - name: Verify backup files exist
+          stat:
+            path: "{{ item }}"
+          register: backup_files
+          loop: "{{ backup_paths }}"
+          failed_when: not backup_files.results | map(attribute='stat.exists') | list | min
+      when: selected_method == 'config_restore'
+
+    - name: Display rollback plan
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║          NETWORK CONFIG ROLLBACK PLAN                      ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📊 Selected Method: {{ selected_method | upper }}
+          🎯 Target Network Configs: {{ target_network_configs | join(', ') }}
+          🖥️  Target Host: {{ inventory_hostname }}
+
+          {% if selected_method == 'snapshot_restore' %}
+          📸 Snapshots: {{ snapshot_ids | length }} archives
+          {% elif selected_method == 'config_restore' %}
+          💾 Backups: {{ backup_paths | length }} files
+          {% else %}
+          🔄 Using playbook-based rollback
+          {% endif %}
+
+          ⚠️  CRITICAL: Network connectivity may be interrupted!
+          🛡️  Safety backup: {{ 'ENABLED' if create_safety_backup else 'DISABLED' }}
+          🔄 Network restart: {{ 'ENABLED' if restart_network_services else 'DISABLED' }}
+          🧪 Connectivity test: {{ 'ENABLED' if test_connectivity else 'DISABLED' }}
+
+    - name: Prompt for confirmation
+      pause:
+        prompt: |
+          ⚠️  CRITICAL WARNING: NETWORK CONFIGURATION ROLLBACK ⚠️
+
+          This will replace current network configurations including:
+          - Network interfaces
+          - Routing tables
+          - DNS configuration
+          - OpenvSwitch settings
+          - Network bridges
+
+          Method: {{ selected_method }}
+          Target: {{ target_network_configs | join(', ') }}
+
+          THIS MAY CAUSE NETWORK DISRUPTION!
+          Ensure you have console access if needed.
+
+          Type 'yes' to continue or 'no' to abort
+      register: confirmation
+      when: verify_before_rollback
+
+    - name: Abort if not confirmed
+      fail:
+        msg: "Network rollback aborted by user"
+      when: verify_before_rollback and confirmation.user_input | lower != 'yes'
+
+    - name: "STAGE 1 - END - Update validation stage"
+      set_fact:
+        stage1_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'validation': {'status': 'complete', 'start_time': stage1_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage1_start | int)}}) }}"
+
+    # STAGE 2: SAFETY BACKUP
+    - name: "STAGE 2 - START - Create safety backup"
+      set_fact:
+        stage2_start: "{{ ansible_date_time.epoch }}"
+      when: create_safety_backup
+
+    - name: Create safety backup directory
+      file:
+        path: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}"
+        state: directory
+        mode: '0750'
+      when: create_safety_backup
+
+    - name: Backup current network configurations
+      block:
+        - name: Archive interface configs
+          archive:
+            path: "{{ network_paths.interfaces }}"
+            dest: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/interfaces.tar.gz"
+            format: gz
+          when: "'interfaces' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Archive routing configs
+          archive:
+            path: "{{ network_paths.routing }}"
+            dest: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/routing.tar.gz"
+            format: gz
+          when: "'routing' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Archive DNS configs
+          archive:
+            path: "{{ network_paths.dns }}"
+            dest: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/dns.tar.gz"
+            format: gz
+          when: "'dns' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Backup OVS database
+          shell: |
+            ovs-vsctl show > {{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/ovs-show.txt
+            ovsdb-client dump > {{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/ovs-db-dump.txt
+          when: "'openvswitch' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Backup current routing table
+          shell: |
+            ip route show > {{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/routes.txt
+            ip addr show > {{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/addresses.txt
+          when: create_safety_backup
+      when: create_safety_backup
+
+    - name: Record safety backup location
+      set_fact:
+        safety_backup_location: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}"
+      when: create_safety_backup
+
+    - name: "STAGE 2 - END - Update safety backup stage"
+      set_fact:
+        stage2_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'complete', 'start_time': stage2_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage2_start | int)}}) }}"
+      when: create_safety_backup
+
+    - name: "STAGE 2 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not create_safety_backup
+
+    # STAGE 3: PRE-CHECK
+    - name: "STAGE 3 - START - Pre-rollback network check"
+      set_fact:
+        stage3_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Capture current network state
+      block:
+        - name: Get current IP addresses
+          shell: ip addr show
+          register: pre_ip_addrs
+          changed_when: false
+
+        - name: Get current routes
+          shell: ip route show
+          register: pre_routes
+          changed_when: false
+
+        - name: Test connectivity before rollback
+          shell: ping -c 2 {{ item }}
+          loop: "{{ test_endpoints }}"
+          register: pre_connectivity
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Get OVS bridge status
+          shell: ovs-vsctl list-br
+          register: pre_ovs_bridges
+          changed_when: false
+          when: "'openvswitch' in target_network_configs"
+          ignore_errors: yes
+
+    - name: "STAGE 3 - END - Update pre-check stage"
+      set_fact:
+        stage3_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'pre_check': {'status': 'complete', 'start_time': stage3_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage3_start | int)}}) }}"
+
+    # STAGE 4: ROLLBACK EXECUTION
+    - name: "STAGE 4 - START - Execute network configuration rollback"
+      set_fact:
+        stage4_start: "{{ ansible_date_time.epoch }}"
+
+    # METHOD 1: SNAPSHOT RESTORE
+    - name: "METHOD 1 - Snapshot Restore"
+      block:
+        - name: Extract network configuration snapshots
+          unarchive:
+            src: "{{ item }}"
+            dest: /
+            remote_src: yes
+          loop: "{{ snapshot_ids }}"
+          register: snapshot_restore_results
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ snapshot_restore_results.results | map(attribute='failed') | list | max == false }}"
+      when: selected_method == 'snapshot_restore'
+
+    # METHOD 2: CONFIG/BACKUP RESTORE
+    - name: "METHOD 2 - Config/Backup Restore"
+      block:
+        - name: Restore from network backup archives
+          unarchive:
+            src: "{{ item }}"
+            dest: /
+            remote_src: yes
+          loop: "{{ backup_paths }}"
+          register: backup_restore_results
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ backup_restore_results.results | map(attribute='failed') | list | max == false }}"
+      when: selected_method == 'config_restore'
+
+    # METHOD 3: PLAYBOOK ROLLBACK
+    - name: "METHOD 3 - Playbook Rollback"
+      block:
+        - name: Find latest network configuration backups
+          find:
+            paths: "{{ backup_dir }}"
+            patterns: "*.tar.gz"
+            age: "-30d"
+            recurse: yes
+          register: found_backups
+
+        - name: Sort backups by modification time
+          set_fact:
+            latest_backups: "{{ found_backups.files | sort(attribute='mtime', reverse=true) | list }}"
+
+        - name: Restore from latest available backups
+          unarchive:
+            src: "{{ item.path }}"
+            dest: /
+            remote_src: yes
+          loop: "{{ latest_backups[:5] }}"
+          register: playbook_restore_results
+          when: latest_backups | length > 0
+          ignore_errors: yes
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ playbook_restore_results.results | map(attribute='failed') | list | max == false if latest_backups | length > 0 else false }}"
+      when: selected_method == 'playbook_rollback'
+
+    - name: "STAGE 4 - END - Update rollback execution stage"
+      set_fact:
+        stage4_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'rollback_execution': {'status': ('complete' if rollback_execution_success else 'failed'), 'start_time': stage4_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage4_start | int)}}) }}"
+
+    # STAGE 5: NETWORK RESTART
+    - name: "STAGE 5 - START - Restart network services"
+      set_fact:
+        stage5_start: "{{ ansible_date_time.epoch }}"
+      when: restart_network_services and rollback_execution_success
+
+    - name: Apply network configuration changes
+      block:
+        - name: Apply netplan configuration
+          shell: netplan apply
+          when: "'interfaces' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Restart networking service (legacy)
+          systemd:
+            name: networking
+            state: restarted
+          when: "'interfaces' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Restart network service (RHEL/CentOS)
+          systemd:
+            name: network
+            state: restarted
+          when: "'interfaces' in target_network_configs and ansible_os_family == 'RedHat'"
+          ignore_errors: yes
+
+        - name: Restart OpenvSwitch
+          systemd:
+            name: openvswitch-switch
+            state: restarted
+          when: "'openvswitch' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Reload OVS database
+          shell: ovs-vsctl --may-exist add-br br-ex
+          when: "'openvswitch' in target_network_configs"
+          ignore_errors: yes
+
+        - name: Flush DNS cache
+          shell: |
+            if command -v systemd-resolve >/dev/null 2>&1; then
+              systemd-resolve --flush-caches
+            elif command -v resolvectl >/dev/null 2>&1; then
+              resolvectl flush-caches
+            fi
+          when: "'dns' in target_network_configs"
+          ignore_errors: yes
+      when: restart_network_services and rollback_execution_success
+
+    - name: Wait for network to stabilize
+      pause:
+        seconds: 30
+      when: restart_network_services and rollback_execution_success
+
+    - name: "STAGE 5 - END - Update network restart stage"
+      set_fact:
+        stage5_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'network_restart': {'status': 'complete', 'start_time': stage5_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage5_start | int)}}) }}"
+      when: restart_network_services and rollback_execution_success
+
+    - name: "STAGE 5 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'network_restart': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not restart_network_services or not rollback_execution_success
+
+    # STAGE 6: VERIFICATION
+    - name: "STAGE 6 - START - Verify network rollback success"
+      set_fact:
+        stage6_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Test network connectivity post-rollback
+      shell: ping -c 3 {{ item }}
+      loop: "{{ test_endpoints }}"
+      register: post_connectivity
+      retries: 5
+      delay: 10
+      until: post_connectivity.rc == 0
+      changed_when: false
+      when: test_connectivity
+
+    - name: Verify IP configuration
+      shell: ip addr show
+      register: post_ip_addrs
+      changed_when: false
+
+    - name: Verify routing table
+      shell: ip route show
+      register: post_routes
+      changed_when: false
+
+    - name: Verify OVS bridges
+      shell: ovs-vsctl list-br
+      register: post_ovs_bridges
+      changed_when: false
+      when: "'openvswitch' in target_network_configs"
+      ignore_errors: yes
+
+    - name: Test DNS resolution
+      shell: nslookup google.com
+      register: dns_test
+      changed_when: false
+      when: "'dns' in target_network_configs"
+      ignore_errors: yes
+
+    - name: Verify Docker network
+      shell: docker network ls
+      register: docker_network_test
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Calculate verification success
+      set_fact:
+        verification_success: >-
+          {{ rollback_execution_success and
+             (post_connectivity.results | selectattr('rc', 'equalto', 0) | list | length > 0 if test_connectivity else true) and
+             (post_ip_addrs.rc == 0) and
+             (post_routes.rc == 0) }}
+
+    - name: "STAGE 6 - END - Update verification stage"
+      set_fact:
+        stage6_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'verification': {'status': ('complete' if verification_success else 'failed'), 'start_time': stage6_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage6_start | int)}}) }}"
+
+    - name: Calculate total execution time
+      set_fact:
+        total_duration: "{{ stage6_end | int - stage1_start | int }}"
+
+    # REPORTING
+    - name: Generate rollback report
+      set_fact:
+        rollback_report:
+          meta:
+            report_type: "network_config_rollback"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            execution_id: "{{ ansible_date_time.epoch }}"
+            playbook_version: "1.0.0"
+            total_duration_seconds: "{{ total_duration | int }}"
+          configuration:
+            rollback_method: "{{ selected_method }}"
+            target_network_configs: "{{ target_network_configs }}"
+            safety_backup_created: "{{ create_safety_backup }}"
+            safety_backup_location: "{{ safety_backup_location | default('none') }}"
+            services_restarted: "{{ restart_network_services }}"
+          execution:
+            stages_completed: 6
+            stages:
+              validation: "{{ rollback_stages.validation }}"
+              safety_backup: "{{ rollback_stages.safety_backup }}"
+              pre_check: "{{ rollback_stages.pre_check }}"
+              rollback_execution: "{{ rollback_stages.rollback_execution }}"
+              network_restart: "{{ rollback_stages.network_restart }}"
+              verification: "{{ rollback_stages.verification }}"
+          results:
+            connectivity_tests_passed: "{{ post_connectivity.results | selectattr('rc', 'equalto', 0) | list | length if test_connectivity else 'not_tested' }}"
+            dns_working: "{{ dns_test.rc == 0 if dns_test is defined else 'not_tested' }}"
+            ovs_bridges_count: "{{ post_ovs_bridges.stdout_lines | length if post_ovs_bridges is defined else 'not_tested' }}"
+            docker_network_ok: "{{ docker_network_test.rc == 0 if docker_network_test is defined else 'not_tested' }}"
+          status:
+            overall: "{{ 'success' if (rollback_execution_success and verification_success) else 'failed' }}"
+            rollback_complete: "{{ rollback_execution_success and verification_success }}"
+            confidence: "{{ 0.88 if (rollback_execution_success and verification_success) else 0.25 }}"
+          decision:
+            action_taken: "network_config_rollback_completed"
+            next_recommended_action: "{{ 'Verify all network services and OpenStack connectivity' if (rollback_execution_success and verification_success) else 'CRITICAL: Restore from safety backup or console access required' }}"
+            manual_intervention_required: "{{ not (rollback_execution_success and verification_success) }}"
+
+    - name: Save rollback report
+      copy:
+        content: "{{ rollback_report | to_nice_json }}"
+        dest: "/var/log/autosphere/network_rollback_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE NETWORK CONFIG ROLLBACK RESULT ===
+          STATUS={{ rollback_report.status.overall | upper }}
+          ROLLBACK_COMPLETE={{ rollback_report.status.rollback_complete }}
+          CONFIDENCE={{ rollback_report.status.confidence }}
+          METHOD={{ rollback_report.configuration.rollback_method | upper }}
+          NETWORK_CONFIGS={{ rollback_report.configuration.target_network_configs | join(',') }}
+          CONNECTIVITY_OK={{ rollback_report.results.connectivity_tests_passed }}
+          DNS_OK={{ rollback_report.results.dns_working }}
+          OVS_BRIDGES={{ rollback_report.results.ovs_bridges_count }}
+          DOCKER_NETWORK_OK={{ rollback_report.results.docker_network_ok }}
+          DURATION={{ rollback_report.meta.total_duration_seconds }}s
+          SAFETY_BACKUP={{ rollback_report.configuration.safety_backup_location }}
+          REPORT_FILE=/var/log/autosphere/network_rollback_{{ ansible_date_time.epoch }}.json
+          === END NETWORK CONFIG ROLLBACK RESULT ===
+
+    - name: Display human-readable summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║          NETWORK CONFIG ROLLBACK - COMPLETE                ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📅 Timestamp: {{ rollback_report.meta.timestamp }}
+          🖥️  Host: {{ rollback_report.meta.hostname }}
+          🔄 Method: {{ rollback_report.configuration.rollback_method | upper }}
+          ⏱️  Duration: {{ rollback_report.meta.total_duration_seconds }}s
+
+          🌐 NETWORK CONFIGURATIONS RESTORED:
+          {{ rollback_report.configuration.target_network_configs | join(', ') }}
+
+          ✅ STAGES COMPLETED: {{ rollback_report.execution.stages_completed }}/6
+
+          📊 VERIFICATION RESULTS:
+          └─ Connectivity Tests: {{ rollback_report.results.connectivity_tests_passed }}
+          └─ DNS Resolution: {{ '✓' if rollback_report.results.dns_working == true else ('✗' if rollback_report.results.dns_working == false else 'N/A') }}
+          └─ OVS Bridges: {{ rollback_report.results.ovs_bridges_count }}
+          └─ Docker Network: {{ '✓' if rollback_report.results.docker_network_ok == true else ('✗' if rollback_report.results.docker_network_ok == false else 'N/A') }}
+
+          🎯 OVERALL STATUS: {{ rollback_report.status.overall | upper }}
+          📈 CONFIDENCE: {{ (rollback_report.status.confidence | float * 100) | round(0) }}%
+
+          💡 NEXT ACTION:
+          {{ rollback_report.decision.next_recommended_action }}
+
+          {% if create_safety_backup %}
+          🛡️  Safety Backup: {{ rollback_report.configuration.safety_backup_location }}
+          {% endif %}
+
+          ╚════════════════════════════════════════════════════════════╝
+
+    - name: Fail if rollback unsuccessful
+      fail:
+        msg: |
+          NETWORK CONFIG ROLLBACK FAILED
+          Method: {{ selected_method }}
+          Safety backup: {{ safety_backup_location | default('none') }}
+          CRITICAL: Console access may be required!
+      when: not (rollback_execution_success and verification_success)

@@ -55,24 +55,36 @@
 
     - name: Check Nova compute service status
       shell: |
-        docker exec nova_api nova-manage service list | grep -E "nova-compute|nova-scheduler|nova-conductor"
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service list -f json
       register: nova_services
       ignore_errors: yes
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Check Neutron agents status
       shell: |
-        docker exec neutron_server neutron agent-list -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list -f json
       register: neutron_agents
       ignore_errors: yes
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Check Cinder services status
       shell: |
-        docker exec cinder_api cinder service-list --binary cinder-volume
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack volume service list -f json
       register: cinder_services
       ignore_errors: yes
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Check API endpoints
       uri:

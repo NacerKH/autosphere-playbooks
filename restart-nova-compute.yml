@@ -34,10 +34,14 @@
       
     - name: Get compute service status
       shell: |
-        docker exec nova_compute openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f json
       register: compute_status
       changed_when: false
       delegate_to: "{{ groups['control'][0] }}"
+      args:
+        executable: /bin/bash
       
     - name: Display current compute service status
       debug:
@@ -45,10 +49,14 @@
         
     - name: List running VMs on this compute node
       shell: |
-        docker exec nova_compute openstack server list --host {{ ansible_hostname }} --all-projects -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack server list --host {{ ansible_hostname }} --all-projects -f json
       register: running_vms
       changed_when: false
       delegate_to: "{{ groups['control'][0] }}"
+      args:
+        executable: /bin/bash
       
     - name: Display running VMs
       debug:
@@ -70,22 +78,34 @@
       block:
         - name: Disable compute service
           shell: |
-            docker exec nova_compute openstack compute service set {{ ansible_hostname }} nova-compute --disable --disable-reason "AutoSphere maintenance"
+            source /root/kolla-venv/bin/activate && \
+            source /etc/kolla/admin-openrc.sh && \
+            openstack compute service set {{ ansible_hostname }} nova-compute --disable --disable-reason "AutoSphere maintenance"
           delegate_to: "{{ groups['control'][0] }}"
+          args:
+            executable: /bin/bash
           
         - name: Get list of VM IDs to evacuate
           shell: |
-            docker exec nova_compute openstack server list --host {{ ansible_hostname }} --all-projects -f value -c ID
+            source /root/kolla-venv/bin/activate && \
+            source /etc/kolla/admin-openrc.sh && \
+            openstack server list --host {{ ansible_hostname }} --all-projects -f value -c ID
           register: vm_ids
           delegate_to: "{{ groups['control'][0] }}"
+          args:
+            executable: /bin/bash
           
         - name: Live migrate each VM
           shell: |
-            docker exec nova_compute openstack server migrate {{ item }} --live-migration --wait
+            source /root/kolla-venv/bin/activate && \
+            source /etc/kolla/admin-openrc.sh && \
+            openstack server migrate {{ item }} --live-migration --wait
           loop: "{{ vm_ids.stdout_lines }}"
           when: vm_ids.stdout_lines | length > 0
           delegate_to: "{{ groups['control'][0] }}"
           ignore_errors: yes
+          args:
+            executable: /bin/bash
           
         - name: Wait for migrations to complete
           pause:
@@ -126,25 +146,37 @@
       
     - name: Re-enable compute service
       shell: |
-        docker exec nova_compute openstack compute service set {{ ansible_hostname }} nova-compute --enable
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service set {{ ansible_hostname }} nova-compute --enable
       delegate_to: "{{ groups['control'][0] }}"
       when: evacuate_vms | bool
+      args:
+        executable: /bin/bash
       
     - name: Wait for compute service to report up
       shell: |
-        docker exec nova_compute openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f value -c State
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f value -c State
       register: service_state
       until: service_state.stdout == "up"
       retries: 12
       delay: 5
       delegate_to: "{{ groups['control'][0] }}"
+      args:
+        executable: /bin/bash
       
     - name: Get final compute service status
       shell: |
-        docker exec nova_compute openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service list --host {{ ansible_hostname }} --service nova-compute -f json
       register: final_status
       changed_when: false
       delegate_to: "{{ groups['control'][0] }}"
+      args:
+        executable: /bin/bash
       
     - name: Check for errors in Nova compute logs
       shell: |

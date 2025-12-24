@@ -1,0 +1,473 @@
+---
+# Database State Rollback Playbook
+# Restores database state from snapshots/backups
+# Part of AutoSphere disaster recovery system
+# Category: database
+
+- name: Rollback Database State
+  hosts: "{{ target_host | default('openstack_controllers') }}"
+  gather_facts: yes
+  become: yes
+  vars:
+    # Rollback method selection (priority order: snapshot_restore -> config_restore -> playbook_rollback)
+    rollback_method: "{{ method | default('auto') }}"  # auto, snapshot_restore, config_restore, playback_rollback
+
+    # Snapshot restore parameters
+    snapshot_ids: "{{ db_snapshot_ids | default([]) }}"
+
+    # Config restore parameters
+    backup_paths: "{{ db_backup_paths | default([]) }}"
+    backup_dir: "/var/backups/autosphere/databases"
+
+    # Database targets
+    target_databases: "{{ databases | default(['nova', 'neutron', 'cinder', 'keystone', 'glance', 'placement']) }}"
+
+    # Safety options
+    create_safety_backup: "{{ safety_backup | default(true) }}"
+    verify_before_rollback: "{{ verify_rollback | default(true) }}"
+
+    # Container names
+    mariadb_container: "{{ db_container | default('mariadb') }}"
+
+    # Rollback stages tracking
+    rollback_stages:
+      validation: { status: "pending", start_time: "", end_time: "", duration: 0, method: "" }
+      safety_backup: { status: "pending", start_time: "", end_time: "", duration: 0, method: "" }
+      stop_services: { status: "pending", start_time: "", end_time: "", duration: 0, method: "" }
+      rollback_execution: { status: "pending", start_time: "", end_time: "", duration: 0, method: "" }
+      start_services: { status: "pending", start_time: "", end_time: "", duration: 0, method: "" }
+      verification: { status: "pending", start_time: "", end_time: "", duration: 0, method: "" }
+
+  tasks:
+    # STAGE 1: VALIDATION & METHOD SELECTION
+    - name: "STAGE 1 - START - Validation and method selection"
+      set_fact:
+        stage1_start: "{{ ansible_date_time.epoch }}"
+      run_once: true
+
+    - name: Verify MariaDB container exists
+      shell: docker ps -a --filter "name={{ mariadb_container }}" --format "table {{.Names}}\t{{.Status}}"
+      register: container_check
+      changed_when: false
+      failed_when: container_check.stdout_lines | length < 2
+
+    - name: Check current database cluster status
+      shell: |
+        docker exec {{ mariadb_container }} mysql -e "SHOW STATUS LIKE 'wsrep_%'" 2>/dev/null || echo "standalone"
+      register: cluster_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Determine rollback method
+      set_fact:
+        selected_method: >-
+          {% if rollback_method == 'auto' %}
+            {% if snapshot_ids | length > 0 %}snapshot_restore
+            {% elif backup_paths | length > 0 %}config_restore
+            {% else %}playbook_rollback
+            {% endif %}
+          {% else %}{{ rollback_method }}
+          {% endif %}
+      run_once: true
+
+    - name: Validate snapshot_restore requirements
+      block:
+        - name: Check snapshot IDs provided
+          fail:
+            msg: "snapshot_restore method requires snapshot_ids parameter"
+          when: snapshot_ids | length == 0
+
+        - name: Verify snapshot files exist
+          stat:
+            path: "{{ item }}"
+          register: snapshot_files
+          loop: "{{ snapshot_ids }}"
+          failed_when: not snapshot_files.results | map(attribute='stat.exists') | list | min
+      when: selected_method == 'snapshot_restore'
+      run_once: true
+
+    - name: Validate config_restore requirements
+      block:
+        - name: Check backup paths provided
+          fail:
+            msg: "config_restore method requires backup_paths parameter"
+          when: backup_paths | length == 0
+
+        - name: Verify backup files exist
+          stat:
+            path: "{{ item }}"
+          register: backup_files
+          loop: "{{ backup_paths }}"
+          failed_when: not backup_files.results | map(attribute='stat.exists') | list | min
+      when: selected_method == 'config_restore'
+      run_once: true
+
+    - name: Display rollback plan
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║          DATABASE ROLLBACK PLAN                            ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📊 Selected Method: {{ selected_method | upper }}
+          🎯 Target Databases: {{ target_databases | join(', ') }}
+
+          {% if selected_method == 'snapshot_restore' %}
+          📸 Snapshots: {{ snapshot_ids | length }} files
+          {% elif selected_method == 'config_restore' %}
+          💾 Backups: {{ backup_paths | length }} files
+          {% else %}
+          🔄 Using playbook-based rollback
+          {% endif %}
+
+          ⚠️  Impact: Database services will be temporarily unavailable
+          🛡️  Safety backup: {{ 'ENABLED' if create_safety_backup else 'DISABLED' }}
+      run_once: true
+
+    - name: "STAGE 1 - END - Update validation stage"
+      set_fact:
+        stage1_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'validation': {'status': 'complete', 'start_time': stage1_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage1_start | int), 'method': selected_method}}) }}"
+
+    # STAGE 2: SAFETY BACKUP
+    - name: "STAGE 2 - START - Create safety backup"
+      set_fact:
+        stage2_start: "{{ ansible_date_time.epoch }}"
+      when: create_safety_backup
+      run_once: true
+
+    - name: Create pre-rollback database backups
+      shell: |
+        mkdir -p {{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}
+        docker exec {{ mariadb_container }} mysqldump {{ item }} \
+          --single-transaction --quick --lock-tables=false \
+          | gzip > {{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/{{ item }}.sql.gz
+      loop: "{{ target_databases }}"
+      register: safety_backups
+      when: create_safety_backup
+      run_once: true
+
+    - name: Record safety backup location
+      set_fact:
+        safety_backup_location: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}"
+      when: create_safety_backup
+      run_once: true
+
+    - name: "STAGE 2 - END - Update safety backup stage"
+      set_fact:
+        stage2_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'complete', 'start_time': stage2_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage2_start | int), 'method': selected_method}}) }}"
+      when: create_safety_backup
+
+    - name: "STAGE 2 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0, 'method': ''}}) }}"
+      when: not create_safety_backup
+
+    # STAGE 3: STOP DEPENDENT SERVICES
+    - name: "STAGE 3 - START - Stop OpenStack services"
+      set_fact:
+        stage3_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Stop OpenStack database clients
+      shell: |
+        docker stop nova_api nova_conductor nova_scheduler nova_compute \
+          neutron_server neutron_dhcp_agent neutron_l3_agent \
+          cinder_api cinder_scheduler cinder_volume \
+          keystone glance_api 2>/dev/null || true
+      register: services_stopped
+      ignore_errors: yes
+
+    - name: Wait for services to stop
+      pause:
+        seconds: 15
+
+    - name: "STAGE 3 - END - Update stop services stage"
+      set_fact:
+        stage3_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'stop_services': {'status': 'complete', 'start_time': stage3_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage3_start | int), 'method': selected_method}}) }}"
+
+    # STAGE 4: ROLLBACK EXECUTION
+    - name: "STAGE 4 - START - Execute rollback"
+      set_fact:
+        stage4_start: "{{ ansible_date_time.epoch }}"
+      run_once: true
+
+    # METHOD 1: SNAPSHOT RESTORE
+    - name: "METHOD 1 - Snapshot Restore"
+      block:
+        - name: Restore databases from snapshots
+          shell: |
+            gunzip < {{ item }} | docker exec -i {{ mariadb_container }} mysql
+          loop: "{{ snapshot_ids }}"
+          register: snapshot_restore_results
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ snapshot_restore_results.results | map(attribute='rc') | list | max == 0 }}"
+      when: selected_method == 'snapshot_restore'
+      run_once: true
+
+    # METHOD 2: CONFIG/BACKUP RESTORE
+    - name: "METHOD 2 - Config/Backup Restore"
+      block:
+        - name: Determine database from backup filename
+          set_fact:
+            db_backup_map: "{{ db_backup_map | default({}) | combine({item | basename | regex_replace('.sql.gz$', '') | regex_replace('.sql$', ''): item}) }}"
+          loop: "{{ backup_paths }}"
+          run_once: true
+
+        - name: Restore databases from backups
+          shell: |
+            if [[ "{{ item.value }}" == *.gz ]]; then
+              gunzip < {{ item.value }} | docker exec -i {{ mariadb_container }} mysql {{ item.key }}
+            else
+              cat {{ item.value }} | docker exec -i {{ mariadb_container }} mysql {{ item.key }}
+            fi
+          loop: "{{ db_backup_map | dict2items }}"
+          register: backup_restore_results
+          when: item.key in target_databases
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ backup_restore_results.results | selectattr('skipped', 'undefined') | map(attribute='rc') | list | max == 0 }}"
+      when: selected_method == 'config_restore'
+      run_once: true
+
+    # METHOD 3: PLAYBOOK ROLLBACK
+    - name: "METHOD 3 - Playbook Rollback"
+      block:
+        - name: Check for latest automatic backup
+          find:
+            paths: "{{ backup_dir }}"
+            patterns: "*.sql.gz"
+            age: "-7d"
+            recurse: yes
+          register: found_backups
+
+        - name: Sort backups by modification time
+          set_fact:
+            latest_backups: "{{ found_backups.files | sort(attribute='mtime', reverse=true) | list }}"
+
+        - name: Restore from latest available backups
+          shell: |
+            gunzip < {{ item.path }} | docker exec -i {{ mariadb_container }} mysql {{ item.path | basename | regex_replace('.sql.gz$', '') }}
+          loop: "{{ latest_backups[:target_databases | length] }}"
+          register: playbook_restore_results
+          when: latest_backups | length > 0
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ playbook_restore_results.results | map(attribute='rc') | list | max == 0 if latest_backups | length > 0 else false }}"
+      when: selected_method == 'playbook_rollback'
+      run_once: true
+
+    - name: "STAGE 4 - END - Update rollback execution stage"
+      set_fact:
+        stage4_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'rollback_execution': {'status': ('complete' if rollback_execution_success else 'failed'), 'start_time': stage4_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage4_start | int), 'method': selected_method}}) }}"
+
+    # STAGE 5: START SERVICES
+    - name: "STAGE 5 - START - Restart OpenStack services"
+      set_fact:
+        stage5_start: "{{ ansible_date_time.epoch }}"
+      when: rollback_execution_success
+
+    - name: Start Keystone first
+      shell: docker start keystone
+      when: rollback_execution_success
+      ignore_errors: yes
+
+    - name: Wait for Keystone
+      pause:
+        seconds: 20
+      when: rollback_execution_success
+
+    - name: Start other OpenStack services
+      shell: |
+        docker start nova_api nova_conductor nova_scheduler nova_compute \
+          neutron_server neutron_dhcp_agent neutron_l3_agent \
+          cinder_api cinder_scheduler cinder_volume \
+          glance_api 2>/dev/null || true
+      when: rollback_execution_success
+
+    - name: Wait for service initialization
+      pause:
+        seconds: 30
+      when: rollback_execution_success
+
+    - name: "STAGE 5 - END - Update start services stage"
+      set_fact:
+        stage5_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'start_services': {'status': 'complete', 'start_time': stage5_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage5_start | int), 'method': selected_method}}) }}"
+      when: rollback_execution_success
+
+    - name: "STAGE 5 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'start_services': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0, 'method': ''}}) }}"
+      when: not rollback_execution_success
+
+    # STAGE 6: VERIFICATION
+    - name: "STAGE 6 - START - Verify rollback success"
+      set_fact:
+        stage6_start: "{{ ansible_date_time.epoch }}"
+      run_once: true
+
+    - name: Test database connectivity
+      shell: |
+        docker exec {{ mariadb_container }} mysql -e "SELECT 1" 2>/dev/null
+      register: db_connectivity
+      retries: 5
+      delay: 10
+      until: db_connectivity.rc == 0
+      changed_when: false
+      run_once: true
+
+    - name: Verify target databases exist
+      shell: |
+        docker exec {{ mariadb_container }} mysql -e "SHOW DATABASES LIKE '{{ item }}'" | grep -c "{{ item }}"
+      loop: "{{ target_databases }}"
+      register: db_exists
+      changed_when: false
+      run_once: true
+
+    - name: Check database table counts
+      shell: |
+        docker exec {{ mariadb_container }} mysql -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='{{ item }}'" {{ item }}
+      loop: "{{ target_databases }}"
+      register: table_counts
+      changed_when: false
+      ignore_errors: yes
+      run_once: true
+
+    - name: Verify cluster status (if Galera)
+      shell: |
+        docker exec {{ mariadb_container }} mysql -e "SHOW STATUS LIKE 'wsrep_cluster_status'" | grep -i primary
+      register: cluster_verify
+      changed_when: false
+      ignore_errors: yes
+      when: "'wsrep' in cluster_status.stdout"
+      run_once: true
+
+    - name: Calculate verification success
+      set_fact:
+        verification_success: >-
+          {{ db_connectivity.rc == 0 and
+             (db_exists.results | map(attribute='stdout') | map('int') | list | min >= 1) and
+             (table_counts.results | selectattr('rc', 'equalto', 0) | list | length == target_databases | length) }}
+      run_once: true
+
+    - name: "STAGE 6 - END - Update verification stage"
+      set_fact:
+        stage6_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'verification': {'status': ('complete' if verification_success else 'failed'), 'start_time': stage6_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage6_start | int), 'method': selected_method}}) }}"
+
+    - name: Calculate total execution time
+      set_fact:
+        total_duration: "{{ stage6_end | int - stage1_start | int }}"
+
+    # REPORTING
+    - name: Generate rollback report
+      set_fact:
+        rollback_report:
+          meta:
+            report_type: "database_state_rollback"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            execution_id: "{{ ansible_date_time.epoch }}"
+            playbook_version: "1.0.0"
+            total_duration_seconds: "{{ total_duration | int }}"
+          configuration:
+            rollback_method: "{{ selected_method }}"
+            target_databases: "{{ target_databases }}"
+            safety_backup_created: "{{ create_safety_backup }}"
+            safety_backup_location: "{{ safety_backup_location | default('none') }}"
+          execution:
+            stages_completed: 6
+            stages:
+              validation: "{{ rollback_stages.validation }}"
+              safety_backup: "{{ rollback_stages.safety_backup }}"
+              stop_services: "{{ rollback_stages.stop_services }}"
+              rollback_execution: "{{ rollback_stages.rollback_execution }}"
+              start_services: "{{ rollback_stages.start_services }}"
+              verification: "{{ rollback_stages.verification }}"
+          results:
+            database_connectivity: "{{ db_connectivity.rc == 0 }}"
+            databases_verified: "{{ db_exists.results | map(attribute='stdout') | map('int') | list | min >= 1 }}"
+            cluster_status: "{{ 'primary' if (cluster_verify is defined and cluster_verify.rc == 0) else 'standalone' }}"
+          status:
+            overall: "{{ 'success' if (rollback_execution_success and verification_success) else 'failed' }}"
+            rollback_complete: "{{ rollback_execution_success and verification_success }}"
+            confidence: "{{ 0.95 if (rollback_execution_success and verification_success) else 0.40 }}"
+          decision:
+            action_taken: "database_rollback_completed"
+            next_recommended_action: "{{ 'Verify OpenStack services are operational' if (rollback_execution_success and verification_success) else 'Investigate database logs and restore from safety backup' }}"
+            manual_intervention_required: "{{ not (rollback_execution_success and verification_success) }}"
+      run_once: true
+
+    - name: Save rollback report
+      copy:
+        content: "{{ rollback_report | to_nice_json }}"
+        dest: "/var/log/autosphere/database_rollback_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE DATABASE ROLLBACK RESULT ===
+          STATUS={{ rollback_report.status.overall | upper }}
+          ROLLBACK_COMPLETE={{ rollback_report.status.rollback_complete }}
+          CONFIDENCE={{ rollback_report.status.confidence }}
+          METHOD={{ rollback_report.configuration.rollback_method | upper }}
+          DATABASES={{ rollback_report.configuration.target_databases | join(',') }}
+          CLUSTER_STATUS={{ rollback_report.results.cluster_status | upper }}
+          DURATION={{ rollback_report.meta.total_duration_seconds }}s
+          SAFETY_BACKUP={{ rollback_report.configuration.safety_backup_location }}
+          REPORT_FILE=/var/log/autosphere/database_rollback_{{ ansible_date_time.epoch }}.json
+          === END DATABASE ROLLBACK RESULT ===
+      run_once: true
+
+    - name: Display human-readable summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║          DATABASE STATE ROLLBACK - COMPLETE                ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📅 Timestamp: {{ rollback_report.meta.timestamp }}
+          🔄 Method: {{ rollback_report.configuration.rollback_method | upper }}
+          ⏱️  Duration: {{ rollback_report.meta.total_duration_seconds }}s
+
+          🎯 TARGET DATABASES:
+          {{ rollback_report.configuration.target_databases | join(', ') }}
+
+          ✅ STAGES COMPLETED: {{ rollback_report.execution.stages_completed }}/6
+
+          📊 VERIFICATION RESULTS:
+          └─ Database Connectivity: {{ '✓' if rollback_report.results.database_connectivity else '✗' }}
+          └─ Databases Verified: {{ '✓' if rollback_report.results.databases_verified else '✗' }}
+          └─ Cluster Status: {{ rollback_report.results.cluster_status | upper }}
+
+          🎯 OVERALL STATUS: {{ rollback_report.status.overall | upper }}
+          📈 CONFIDENCE: {{ (rollback_report.status.confidence | float * 100) | round(0) }}%
+
+          💡 NEXT ACTION:
+          {{ rollback_report.decision.next_recommended_action }}
+
+          {% if create_safety_backup %}
+          🛡️  Safety Backup: {{ rollback_report.configuration.safety_backup_location }}
+          {% endif %}
+
+          ╚════════════════════════════════════════════════════════════╝
+      run_once: true
+
+    - name: Fail if rollback unsuccessful
+      fail:
+        msg: |
+          DATABASE ROLLBACK FAILED
+          Method: {{ selected_method }}
+          Safety backup: {{ safety_backup_location | default('none') }}
+          Manual intervention required.
+      when: not (rollback_execution_success and verification_success)
+      run_once: true

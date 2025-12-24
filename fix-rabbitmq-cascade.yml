@@ -30,15 +30,23 @@
 
     - name: Check Nova service status
       shell: |
-        docker exec nova_api nova-manage service list | grep -c "XXX" || true
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service list -f json | jq '[.[] | select(.State!="up")] | length'
       register: nova_down_count
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Check Neutron agent status
       shell: |
-        docker exec neutron_server neutron agent-list -f json | jq -r '.[] | select(.alive==false) | .agent_type' | wc -l
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list -f json | jq '[.[] | select(.Alive==false)] | length'
       register: neutron_down_count
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Check timeout errors in logs
       shell: |
@@ -172,19 +180,27 @@
 
     - name: Verify Nova services
       shell: |
-        docker exec nova_api nova-manage service list | grep -c ":-)" || true
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service list -f json | jq '[.[] | select(.State=="up")] | length'
       register: nova_verify
       retries: 10
       delay: 10
       until: nova_verify.stdout | int > 0
+      args:
+        executable: /bin/bash
 
     - name: Verify Neutron agents
       shell: |
-        docker exec neutron_server neutron agent-list -f json | jq -r '.[] | select(.alive==true) | .agent_type' | wc -l
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list -f json | jq '[.[] | select(.Alive==true)] | length'
       register: neutron_verify
       retries: 10
       delay: 10
       until: neutron_verify.stdout | int > 0
+      args:
+        executable: /bin/bash
 
     - name: Check for new timeout errors
       shell: |

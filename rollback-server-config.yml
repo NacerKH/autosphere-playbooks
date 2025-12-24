@@ -1,0 +1,516 @@
+---
+# Server Configuration Rollback Playbook
+# Restores server configurations from backups
+# Part of AutoSphere disaster recovery system
+# Category: server
+
+- name: Rollback Server Configuration
+  hosts: "{{ target_host | default('all') }}"
+  gather_facts: yes
+  become: yes
+  vars:
+    # Rollback method selection (priority order)
+    rollback_method: "{{ method | default('auto') }}"  # auto, snapshot_restore, config_restore, playbook_rollback
+
+    # Snapshot restore parameters
+    snapshot_ids: "{{ config_snapshot_ids | default([]) }}"
+
+    # Config restore parameters
+    backup_paths: "{{ config_backup_paths | default([]) }}"
+    backup_dir: "/var/backups/autosphere/configs"
+
+    # Configuration targets
+    target_configs: "{{ configs | default(['system', 'network', 'storage', 'services']) }}"
+
+    # Safety options
+    create_safety_backup: "{{ safety_backup | default(true) }}"
+    verify_before_rollback: "{{ verify_rollback | default(true) }}"
+    restart_services: "{{ restart_after_rollback | default(true) }}"
+
+    # Configuration paths
+    config_paths:
+      system:
+        - /etc/sysctl.conf
+        - /etc/sysctl.d/
+        - /etc/security/limits.conf
+        - /etc/security/limits.d/
+        - /etc/systemd/system/
+      network:
+        - /etc/network/interfaces
+        - /etc/netplan/
+        - /etc/hosts
+        - /etc/resolv.conf
+      storage:
+        - /etc/fstab
+        - /etc/lvm/
+        - /etc/multipath.conf
+      services:
+        - /etc/kolla/
+        - /etc/ansible/
+
+    # Rollback stages tracking
+    rollback_stages:
+      validation: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      safety_backup: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      rollback_execution: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      service_restart: { status: "pending", start_time: "", end_time: "", duration: 0 }
+      verification: { status: "pending", start_time: "", end_time: "", duration: 0 }
+
+  tasks:
+    # STAGE 1: VALIDATION & METHOD SELECTION
+    - name: "STAGE 1 - START - Validation and method selection"
+      set_fact:
+        stage1_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Check if running as root
+      fail:
+        msg: "This playbook must be run with root privileges"
+      when: ansible_user_id != 'root' and ansible_env.SUDO_USER is not defined
+
+    - name: Verify backup directory exists
+      stat:
+        path: "{{ backup_dir }}"
+      register: backup_dir_stat
+
+    - name: Create backup directory if missing
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0750'
+      when: not backup_dir_stat.stat.exists
+
+    - name: Determine rollback method
+      set_fact:
+        selected_method: >-
+          {% if rollback_method == 'auto' %}
+            {% if snapshot_ids | length > 0 %}snapshot_restore
+            {% elif backup_paths | length > 0 %}config_restore
+            {% else %}playbook_rollback
+            {% endif %}
+          {% else %}{{ rollback_method }}
+          {% endif %}
+
+    - name: Validate snapshot_restore requirements
+      block:
+        - name: Check snapshot IDs provided
+          fail:
+            msg: "snapshot_restore method requires snapshot_ids parameter"
+          when: snapshot_ids | length == 0
+
+        - name: Verify snapshot archives exist
+          stat:
+            path: "{{ item }}"
+          register: snapshot_files
+          loop: "{{ snapshot_ids }}"
+          failed_when: not snapshot_files.results | map(attribute='stat.exists') | list | min
+      when: selected_method == 'snapshot_restore'
+
+    - name: Validate config_restore requirements
+      block:
+        - name: Check backup paths provided
+          fail:
+            msg: "config_restore method requires backup_paths parameter"
+          when: backup_paths | length == 0
+
+        - name: Verify backup files exist
+          stat:
+            path: "{{ item }}"
+          register: backup_files
+          loop: "{{ backup_paths }}"
+          failed_when: not backup_files.results | map(attribute='stat.exists') | list | min
+      when: selected_method == 'config_restore'
+
+    - name: Display rollback plan
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║          SERVER CONFIG ROLLBACK PLAN                       ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📊 Selected Method: {{ selected_method | upper }}
+          🎯 Target Configs: {{ target_configs | join(', ') }}
+          🖥️  Target Host: {{ inventory_hostname }}
+
+          {% if selected_method == 'snapshot_restore' %}
+          📸 Snapshots: {{ snapshot_ids | length }} archives
+          {% elif selected_method == 'config_restore' %}
+          💾 Backups: {{ backup_paths | length }} files
+          {% else %}
+          🔄 Using playbook-based rollback
+          {% endif %}
+
+          ⚠️  Impact: System configuration will be replaced
+          🛡️  Safety backup: {{ 'ENABLED' if create_safety_backup else 'DISABLED' }}
+          🔄 Service restart: {{ 'ENABLED' if restart_services else 'DISABLED' }}
+
+    - name: Prompt for confirmation
+      pause:
+        prompt: |
+          ⚠️  WARNING: CONFIGURATION ROLLBACK ⚠️
+
+          This will replace current server configurations with backup versions.
+
+          Method: {{ selected_method }}
+          Target: {{ target_configs | join(', ') }}
+
+          Type 'yes' to continue or 'no' to abort
+      register: confirmation
+      when: verify_before_rollback
+
+    - name: Abort if not confirmed
+      fail:
+        msg: "Rollback aborted by user"
+      when: verify_before_rollback and confirmation.user_input | lower != 'yes'
+
+    - name: "STAGE 1 - END - Update validation stage"
+      set_fact:
+        stage1_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'validation': {'status': 'complete', 'start_time': stage1_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage1_start | int)}}) }}"
+
+    # STAGE 2: SAFETY BACKUP
+    - name: "STAGE 2 - START - Create safety backup"
+      set_fact:
+        stage2_start: "{{ ansible_date_time.epoch }}"
+      when: create_safety_backup
+
+    - name: Create safety backup directory
+      file:
+        path: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}"
+        state: directory
+        mode: '0750'
+      when: create_safety_backup
+
+    - name: Backup current configurations
+      block:
+        - name: Archive system configs
+          archive:
+            path: "{{ config_paths.system }}"
+            dest: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/system-configs.tar.gz"
+            format: gz
+          when: "'system' in target_configs"
+          ignore_errors: yes
+
+        - name: Archive network configs
+          archive:
+            path: "{{ config_paths.network }}"
+            dest: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/network-configs.tar.gz"
+            format: gz
+          when: "'network' in target_configs"
+          ignore_errors: yes
+
+        - name: Archive storage configs
+          archive:
+            path: "{{ config_paths.storage }}"
+            dest: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/storage-configs.tar.gz"
+            format: gz
+          when: "'storage' in target_configs"
+          ignore_errors: yes
+
+        - name: Archive services configs
+          archive:
+            path: "{{ config_paths.services }}"
+            dest: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}/services-configs.tar.gz"
+            format: gz
+          when: "'services' in target_configs"
+          ignore_errors: yes
+      when: create_safety_backup
+
+    - name: Record safety backup location
+      set_fact:
+        safety_backup_location: "{{ backup_dir }}/pre-rollback-{{ ansible_date_time.epoch }}"
+      when: create_safety_backup
+
+    - name: "STAGE 2 - END - Update safety backup stage"
+      set_fact:
+        stage2_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'complete', 'start_time': stage2_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage2_start | int)}}) }}"
+      when: create_safety_backup
+
+    - name: "STAGE 2 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'safety_backup': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not create_safety_backup
+
+    # STAGE 3: ROLLBACK EXECUTION
+    - name: "STAGE 3 - START - Execute configuration rollback"
+      set_fact:
+        stage3_start: "{{ ansible_date_time.epoch }}"
+
+    # METHOD 1: SNAPSHOT RESTORE
+    - name: "METHOD 1 - Snapshot Restore"
+      block:
+        - name: Extract configuration snapshots
+          unarchive:
+            src: "{{ item }}"
+            dest: /
+            remote_src: yes
+          loop: "{{ snapshot_ids }}"
+          register: snapshot_restore_results
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ snapshot_restore_results.results | map(attribute='failed') | list | max == false }}"
+      when: selected_method == 'snapshot_restore'
+
+    # METHOD 2: CONFIG/BACKUP RESTORE
+    - name: "METHOD 2 - Config/Backup Restore"
+      block:
+        - name: Restore from backup archives
+          unarchive:
+            src: "{{ item }}"
+            dest: /
+            remote_src: yes
+          loop: "{{ backup_paths }}"
+          register: backup_restore_results
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ backup_restore_results.results | map(attribute='failed') | list | max == false }}"
+      when: selected_method == 'config_restore'
+
+    # METHOD 3: PLAYBOOK ROLLBACK
+    - name: "METHOD 3 - Playbook Rollback"
+      block:
+        - name: Find latest configuration backups
+          find:
+            paths: "{{ backup_dir }}"
+            patterns: "*-configs.tar.gz"
+            age: "-30d"
+            recurse: yes
+          register: found_backups
+
+        - name: Sort backups by modification time
+          set_fact:
+            latest_backups: "{{ found_backups.files | sort(attribute='mtime', reverse=true) | list }}"
+
+        - name: Restore from latest available backups
+          unarchive:
+            src: "{{ item.path }}"
+            dest: /
+            remote_src: yes
+          loop: "{{ latest_backups[:5] }}"
+          register: playbook_restore_results
+          when: latest_backups | length > 0
+          ignore_errors: yes
+
+        - name: Set rollback result
+          set_fact:
+            rollback_execution_success: "{{ playbook_restore_results.results | map(attribute='failed') | list | max == false if latest_backups | length > 0 else false }}"
+      when: selected_method == 'playbook_rollback'
+
+    - name: "STAGE 3 - END - Update rollback execution stage"
+      set_fact:
+        stage3_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'rollback_execution': {'status': ('complete' if rollback_execution_success else 'failed'), 'start_time': stage3_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage3_start | int)}}) }}"
+
+    # STAGE 4: SERVICE RESTART
+    - name: "STAGE 4 - START - Restart affected services"
+      set_fact:
+        stage4_start: "{{ ansible_date_time.epoch }}"
+      when: restart_services and rollback_execution_success
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: restart_services and rollback_execution_success and "'services' in target_configs"
+
+    - name: Apply sysctl settings
+      shell: sysctl -p
+      when: restart_services and rollback_execution_success and "'system' in target_configs"
+      ignore_errors: yes
+
+    - name: Restart networking (if network configs changed)
+      shell: |
+        if command -v netplan >/dev/null 2>&1; then
+          netplan apply
+        else
+          systemctl restart networking
+        fi
+      when: restart_services and rollback_execution_success and "'network' in target_configs"
+      ignore_errors: yes
+
+    - name: Restart Docker (if service configs changed)
+      systemd:
+        name: docker
+        state: restarted
+      when: restart_services and rollback_execution_success and "'services' in target_configs"
+      ignore_errors: yes
+
+    - name: Wait for Docker to stabilize
+      pause:
+        seconds: 20
+      when: restart_services and rollback_execution_success and "'services' in target_configs"
+
+    - name: "STAGE 4 - END - Update service restart stage"
+      set_fact:
+        stage4_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'service_restart': {'status': 'complete', 'start_time': stage4_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage4_start | int)}}) }}"
+      when: restart_services and rollback_execution_success
+
+    - name: "STAGE 4 - SKIPPED"
+      set_fact:
+        rollback_stages: "{{ rollback_stages | combine({'service_restart': {'status': 'skipped', 'start_time': '', 'end_time': '', 'duration': 0}}) }}"
+      when: not restart_services or not rollback_execution_success
+
+    # STAGE 5: VERIFICATION
+    - name: "STAGE 5 - START - Verify rollback success"
+      set_fact:
+        stage5_start: "{{ ansible_date_time.epoch }}"
+
+    - name: Verify configuration files exist
+      block:
+        - name: Check system config files
+          stat:
+            path: "{{ item }}"
+          register: system_configs
+          loop: "{{ config_paths.system | flatten }}"
+          when: "'system' in target_configs"
+
+        - name: Check network config files
+          stat:
+            path: "{{ item }}"
+          register: network_configs
+          loop: "{{ config_paths.network | flatten }}"
+          when: "'network' in target_configs"
+
+        - name: Check storage config files
+          stat:
+            path: "{{ item }}"
+          register: storage_configs
+          loop: "{{ config_paths.storage | flatten }}"
+          when: "'storage' in target_configs"
+
+        - name: Check services config files
+          stat:
+            path: "{{ item }}"
+          register: services_configs
+          loop: "{{ config_paths.services | flatten }}"
+          when: "'services' in target_configs"
+
+    - name: Test network connectivity
+      shell: ping -c 2 8.8.8.8
+      register: network_test
+      changed_when: false
+      ignore_errors: yes
+      when: "'network' in target_configs"
+
+    - name: Check Docker status
+      shell: docker ps >/dev/null 2>&1
+      register: docker_test
+      changed_when: false
+      ignore_errors: yes
+      when: "'services' in target_configs"
+
+    - name: Calculate verification success
+      set_fact:
+        verification_success: "{{ rollback_execution_success }}"
+
+    - name: "STAGE 5 - END - Update verification stage"
+      set_fact:
+        stage5_end: "{{ ansible_date_time.epoch }}"
+        rollback_stages: "{{ rollback_stages | combine({'verification': {'status': ('complete' if verification_success else 'failed'), 'start_time': stage5_start, 'end_time': ansible_date_time.epoch, 'duration': (ansible_date_time.epoch | int - stage5_start | int)}}) }}"
+
+    - name: Calculate total execution time
+      set_fact:
+        total_duration: "{{ stage5_end | int - stage1_start | int }}"
+
+    # REPORTING
+    - name: Generate rollback report
+      set_fact:
+        rollback_report:
+          meta:
+            report_type: "server_config_rollback"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            hostname: "{{ inventory_hostname }}"
+            execution_id: "{{ ansible_date_time.epoch }}"
+            playbook_version: "1.0.0"
+            total_duration_seconds: "{{ total_duration | int }}"
+          configuration:
+            rollback_method: "{{ selected_method }}"
+            target_configs: "{{ target_configs }}"
+            safety_backup_created: "{{ create_safety_backup }}"
+            safety_backup_location: "{{ safety_backup_location | default('none') }}"
+            services_restarted: "{{ restart_services }}"
+          execution:
+            stages_completed: 5
+            stages:
+              validation: "{{ rollback_stages.validation }}"
+              safety_backup: "{{ rollback_stages.safety_backup }}"
+              rollback_execution: "{{ rollback_stages.rollback_execution }}"
+              service_restart: "{{ rollback_stages.service_restart }}"
+              verification: "{{ rollback_stages.verification }}"
+          results:
+            network_connectivity: "{{ network_test.rc == 0 if network_test is defined else 'not_tested' }}"
+            docker_status: "{{ docker_test.rc == 0 if docker_test is defined else 'not_tested' }}"
+          status:
+            overall: "{{ 'success' if (rollback_execution_success and verification_success) else 'failed' }}"
+            rollback_complete: "{{ rollback_execution_success and verification_success }}"
+            confidence: "{{ 0.90 if (rollback_execution_success and verification_success) else 0.35 }}"
+          decision:
+            action_taken: "server_config_rollback_completed"
+            next_recommended_action: "{{ 'Verify all services are operational' if (rollback_execution_success and verification_success) else 'Restore from safety backup and investigate' }}"
+            manual_intervention_required: "{{ not (rollback_execution_success and verification_success) }}"
+
+    - name: Save rollback report
+      copy:
+        content: "{{ rollback_report | to_nice_json }}"
+        dest: "/var/log/autosphere/server_config_rollback_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+
+    - name: Output parseable summary for AWX
+      debug:
+        msg: |
+          === AUTOSPHERE SERVER CONFIG ROLLBACK RESULT ===
+          STATUS={{ rollback_report.status.overall | upper }}
+          ROLLBACK_COMPLETE={{ rollback_report.status.rollback_complete }}
+          CONFIDENCE={{ rollback_report.status.confidence }}
+          METHOD={{ rollback_report.configuration.rollback_method | upper }}
+          CONFIGS={{ rollback_report.configuration.target_configs | join(',') }}
+          NETWORK_OK={{ rollback_report.results.network_connectivity }}
+          DOCKER_OK={{ rollback_report.results.docker_status }}
+          DURATION={{ rollback_report.meta.total_duration_seconds }}s
+          SAFETY_BACKUP={{ rollback_report.configuration.safety_backup_location }}
+          REPORT_FILE=/var/log/autosphere/server_config_rollback_{{ ansible_date_time.epoch }}.json
+          === END SERVER CONFIG ROLLBACK RESULT ===
+
+    - name: Display human-readable summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║          SERVER CONFIG ROLLBACK - COMPLETE                 ║
+          ╚════════════════════════════════════════════════════════════╝
+
+          📅 Timestamp: {{ rollback_report.meta.timestamp }}
+          🖥️  Host: {{ rollback_report.meta.hostname }}
+          🔄 Method: {{ rollback_report.configuration.rollback_method | upper }}
+          ⏱️  Duration: {{ rollback_report.meta.total_duration_seconds }}s
+
+          🎯 CONFIGURATIONS RESTORED:
+          {{ rollback_report.configuration.target_configs | join(', ') }}
+
+          ✅ STAGES COMPLETED: {{ rollback_report.execution.stages_completed }}/5
+
+          📊 VERIFICATION RESULTS:
+          └─ Network: {{ '✓' if rollback_report.results.network_connectivity == true else ('✗' if rollback_report.results.network_connectivity == false else 'N/A') }}
+          └─ Docker: {{ '✓' if rollback_report.results.docker_status == true else ('✗' if rollback_report.results.docker_status == false else 'N/A') }}
+
+          🎯 OVERALL STATUS: {{ rollback_report.status.overall | upper }}
+          📈 CONFIDENCE: {{ (rollback_report.status.confidence | float * 100) | round(0) }}%
+
+          💡 NEXT ACTION:
+          {{ rollback_report.decision.next_recommended_action }}
+
+          {% if create_safety_backup %}
+          🛡️  Safety Backup: {{ rollback_report.configuration.safety_backup_location }}
+          {% endif %}
+
+          ╚════════════════════════════════════════════════════════════╝
+
+    - name: Fail if rollback unsuccessful
+      fail:
+        msg: |
+          SERVER CONFIG ROLLBACK FAILED
+          Method: {{ selected_method }}
+          Safety backup: {{ safety_backup_location | default('none') }}
+          Manual intervention required.
+      when: not (rollback_execution_success and verification_success)

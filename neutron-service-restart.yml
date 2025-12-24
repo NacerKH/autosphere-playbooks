@@ -19,11 +19,15 @@
   tasks:
     - name: Check current Neutron agent status
       shell: |
-        docker exec neutron_server neutron agent-list -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list -f json
       register: pre_agent_status
       ignore_errors: yes
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Parse down agents
       set_fact:
@@ -67,35 +71,51 @@
 
     - name: Check post-restart agent status
       shell: |
-        docker exec neutron_server neutron agent-list -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list -f json
       register: post_agent_status
       retries: 10
       delay: 10
       until: post_agent_status.rc == 0
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Count agents alive
       shell: |
-        docker exec neutron_server neutron agent-list -f json | jq -r '.[] | select(.alive==true) | .agent_type' | wc -l
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list -f json | jq '[.[] | select(.Alive==true)] | length'
       register: agents_alive
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Verify network connectivity
       shell: |
-        docker exec neutron_server openstack network list --limit 1 -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network list --limit 1 -f json
       register: network_list_test
       ignore_errors: yes
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Test DHCP agents
       shell: |
-        docker exec neutron_server neutron agent-list --agent-type dhcp -f json | jq -r '.[] | select(.alive==true) | .id' | wc -l
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list --agent-type dhcp -f json | jq '[.[] | select(.Alive==true)] | length'
       register: dhcp_agents
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Generate restart report
       set_fact:

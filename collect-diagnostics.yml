@@ -53,32 +53,50 @@
 
     - name: Collect Nova diagnostics
       shell: |
-        docker exec nova_api nova-manage service list > {{ diag_dir }}/{{ diag_timestamp }}/nova-services.txt
-        docker exec nova_api nova hypervisor-list > {{ diag_dir }}/{{ diag_timestamp }}/nova-hypervisors.txt
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack compute service list -f json > {{ diag_dir }}/{{ diag_timestamp }}/nova-services.txt
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack hypervisor list -f json > {{ diag_dir }}/{{ diag_timestamp }}/nova-hypervisors.txt
         docker logs nova_api --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/nova-api-logs.txt 2>&1
         docker logs nova_scheduler --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/nova-scheduler-logs.txt 2>&1
         docker logs nova_conductor --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/nova-conductor-logs.txt 2>&1
       ignore_errors: yes
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Collect Neutron diagnostics
       shell: |
-        docker exec neutron_server neutron agent-list > {{ diag_dir }}/{{ diag_timestamp }}/neutron-agents.txt
-        docker exec neutron_server openstack network list > {{ diag_dir }}/{{ diag_timestamp }}/neutron-networks.txt
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network agent list -f json > {{ diag_dir }}/{{ diag_timestamp }}/neutron-agents.txt
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack network list -f json > {{ diag_dir }}/{{ diag_timestamp }}/neutron-networks.txt
         docker logs neutron_server --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/neutron-server-logs.txt 2>&1
         docker logs neutron_l3_agent --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/neutron-l3-logs.txt 2>&1
         docker logs neutron_dhcp_agent --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/neutron-dhcp-logs.txt 2>&1
       ignore_errors: yes
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Collect Cinder diagnostics
       shell: |
-        docker exec cinder_api cinder service-list > {{ diag_dir }}/{{ diag_timestamp }}/cinder-services.txt
-        docker exec cinder_api openstack volume list > {{ diag_dir }}/{{ diag_timestamp }}/cinder-volumes.txt
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack volume service list -f json > {{ diag_dir }}/{{ diag_timestamp }}/cinder-services.txt
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack volume list -f json > {{ diag_dir }}/{{ diag_timestamp }}/cinder-volumes.txt
         docker logs cinder_api --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/cinder-api-logs.txt 2>&1
         docker logs cinder_scheduler --since {{ log_hours }}h > {{ diag_dir }}/{{ diag_timestamp }}/cinder-scheduler-logs.txt 2>&1
       ignore_errors: yes
       changed_when: false
+      args:
+        executable: /bin/bash
 
     - name: Search for error patterns
       shell: |

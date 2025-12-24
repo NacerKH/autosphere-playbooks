@@ -19,22 +19,31 @@
   tasks:
     - name: "[PRE-CHECK] Verify compute node exists"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack compute service list --service nova-compute --host {{ compute_node }} --format json
       register: compute_check
       failed_when: compute_check.stdout == "[]"
+      args:
+        executable: /bin/bash
       
     - name: "[PRE-CHECK] List VMs on compute node"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack server list --host {{ compute_node }} --all-projects --format json
       register: vm_list
+      args:
+        executable: /bin/bash
       
     - name: "[PRE-CHECK] Check available compute capacity"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack hypervisor stats show --format json
       register: capacity_check
+      args:
+        executable: /bin/bash
       
     - name: "[ANALYSIS] Verify sufficient capacity for evacuation"
       set_fact:
@@ -52,34 +61,41 @@
     - name: "[BACKUP] Save VM state information"
       shell: |
         mkdir -p /tmp/vm_evacuation_{{ incident_id }}
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack server list --host {{ compute_node }} --all-projects --format json \
           > /tmp/vm_evacuation_{{ incident_id }}/vms_before.json
+      args:
+        executable: /bin/bash
           
     - name: "[EXECUTE] Disable compute service"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack compute service set --disable {{ compute_node }} nova-compute \
           --disable-reason "AutoSphere evacuation - {{ incident_id }}"
+      args:
+        executable: /bin/bash
           
     - name: "[EXECUTE] Evacuate VMs"
       shell: |
-        source /etc/kolla/admin-openrc.sh
-        
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         {% if skip_shared_storage %}
-        # Evacuate without shared storage (rebuilds VMs)
         nova host-evacuate --on-shared-storage {{ compute_node }}
         {% else %}
-        # Standard evacuation
         nova host-evacuate {{ compute_node }}
         {% endif %}
       register: evacuation_output
       async: 3600
       poll: 30
+      args:
+        executable: /bin/bash
       
     - name: "[MONITOR] Track evacuation progress"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         remaining=$(openstack server list --host {{ compute_node }} --all-projects --format json | jq '. | length')
         echo "Remaining VMs on {{ compute_node }}: $remaining"
         exit $remaining
@@ -88,17 +104,23 @@
       delay: 30
       until: evacuation_progress.rc == 0
       ignore_errors: yes
+      args:
+        executable: /bin/bash
       
     - name: "[VERIFY] Confirm all VMs evacuated"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack server list --host {{ compute_node }} --all-projects --format json
       register: final_vm_list
       failed_when: (final_vm_list.stdout | from_json) | length > 0
+      args:
+        executable: /bin/bash
       
     - name: "[VERIFY] Check evacuated VM states"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         cat /tmp/vm_evacuation_{{ incident_id }}/vms_before.json | \
           jq -r '.[].ID' | \
           while read vm_id; do
@@ -107,10 +129,13 @@
             echo "$vm_id: $state on $host"
           done
       register: vm_states
+      args:
+        executable: /bin/bash
       
     - name: "[POST-CHECK] Verify VMs are active"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         failed_vms=0
         cat /tmp/vm_evacuation_{{ incident_id }}/vms_before.json | \
           jq -r '.[].ID' | \
@@ -124,6 +149,8 @@
         exit $failed_vms
       register: vm_health_check
       failed_when: vm_health_check.rc > 0
+      args:
+        executable: /bin/bash
       
     - name: "[OPTIONAL] Restart compute service"
       when: restart_after_evacuation | default(false)
@@ -137,8 +164,11 @@
             
         - name: Enable compute service
           shell: |
-            source /etc/kolla/admin-openrc.sh
+            source /root/kolla-venv/bin/activate && \
+            source /etc/kolla/admin-openrc.sh && \
             openstack compute service set --enable {{ compute_node }} nova-compute
+          args:
+            executable: /bin/bash
             
     - name: "[REPORT] Generate evacuation report"
       copy:
@@ -183,9 +213,12 @@
   rescue:
     - name: "[ROLLBACK] Re-enable compute service"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack compute service set --enable {{ compute_node }} nova-compute
       ignore_errors: yes
+      args:
+        executable: /bin/bash
       
     - name: "[ALERT] Evacuation failed"
       debug:

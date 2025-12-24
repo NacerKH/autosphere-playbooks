@@ -18,11 +18,15 @@
   tasks:
     - name: Check current Cinder service status
       shell: |
-        docker exec cinder_api cinder service-list
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack volume service list -f json
       register: pre_service_status
       ignore_errors: yes
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Identify down services
       set_fact:
@@ -63,28 +67,40 @@
 
     - name: Check post-restart service status
       shell: |
-        docker exec cinder_api cinder service-list
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack volume service list -f json
       register: post_service_status
       retries: 10
       delay: 10
       until: post_service_status.rc == 0
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Count services up
       shell: |
-        docker exec cinder_api cinder service-list | grep -c "up" || true
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack volume service list -f json | jq '[.[] | select(.State=="up")] | length'
       register: services_up
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Test volume operations
       shell: |
-        docker exec cinder_api openstack volume list --limit 1 -f json
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
+        openstack volume list --limit 1 -f json
       register: volume_test
       ignore_errors: yes
       changed_when: false
       run_once: true
+      args:
+        executable: /bin/bash
 
     - name: Generate restart report
       set_fact:

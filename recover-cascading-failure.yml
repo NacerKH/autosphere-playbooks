@@ -170,7 +170,8 @@
       
     - name: "[VERIFY] Check OpenStack API endpoints"
       shell: |
-        source /etc/kolla/admin-openrc.sh
+        source /root/kolla-venv/bin/activate && \
+        source /etc/kolla/admin-openrc.sh && \
         openstack endpoint list --format json > /tmp/endpoints_{{ incident_id }}.json
         
         # Test each service
@@ -179,6 +180,8 @@
         done
       register: api_check
       ignore_errors: yes
+      args:
+        executable: /bin/bash
       
     - name: "[VERIFY] Verify RabbitMQ connections"
       when: "'rabbitmq' in failed_services"
