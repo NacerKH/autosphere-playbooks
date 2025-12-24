@@ -1,0 +1,201 @@
+---
+# Docker Container Health Check Playbook
+# Validates container health and collects diagnostics
+# AWX Template ID: 22 (suggested)
+
+- name: Docker Container Health Check
+  hosts: "{{ target_host | default('openstack') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    container_name: "{{ container | default('neutron_server') }}"
+    collect_logs: "{{ logs | default(true) }}"
+    log_lines: "{{ lines | default(100) }}"
+
+  tasks:
+    # =========================================================================
+    # CONTAINER STATUS
+    # =========================================================================
+    
+    - name: Check if container exists
+      ansible.builtin.command:
+        cmd: "docker ps -a --filter name=^{{ container_name }}$ --format '{{ '{{' }}.Names{{ '}}' }}'"
+      register: container_exists
+      changed_when: false
+
+    - name: Container not found
+      ansible.builtin.debug:
+        msg: "Container '{{ container_name }}' does not exist on this host"
+      when: container_exists.stdout == ""
+
+    - name: Get container details
+      ansible.builtin.command:
+        cmd: >
+          docker inspect {{ container_name }} --format 
+          'Status: {{ '{{' }}.State.Status{{ '}}' }}
+          Running: {{ '{{' }}.State.Running{{ '}}' }}
+          Pid: {{ '{{' }}.State.Pid{{ '}}' }}
+          ExitCode: {{ '{{' }}.State.ExitCode{{ '}}' }}
+          StartedAt: {{ '{{' }}.State.StartedAt{{ '}}' }}
+          FinishedAt: {{ '{{' }}.State.FinishedAt{{ '}}' }}
+          RestartCount: {{ '{{' }}.RestartCount{{ '}}' }}'
+      register: container_details
+      changed_when: false
+      when: container_exists.stdout != ""
+
+    - name: Display container status
+      ansible.builtin.debug:
+        msg: "{{ container_details.stdout_lines }}"
+      when: container_exists.stdout != ""
+
+    # =========================================================================
+    # HEALTH CHECK STATUS
+    # =========================================================================
+    
+    - name: Get health check status
+      ansible.builtin.command:
+        cmd: >
+          docker inspect {{ container_name }} --format 
+          '{{ '{{' }}if .State.Health{{ '}}' }}Health: {{ '{{' }}.State.Health.Status{{ '}}' }}
+          FailingStreak: {{ '{{' }}.State.Health.FailingStreak{{ '}}' }}{{ '{{' }}else{{ '}}' }}Health: no-healthcheck-configured{{ '{{' }}end{{ '}}' }}'
+      register: health_details
+      changed_when: false
+      failed_when: false
+      when: container_exists.stdout != ""
+
+    - name: Display health status
+      ansible.builtin.debug:
+        msg: "{{ health_details.stdout }}"
+      when: 
+        - container_exists.stdout != ""
+        - health_details.stdout is defined
+
+    # =========================================================================
+    # RESOURCE USAGE
+    # =========================================================================
+    
+    - name: Get container resource usage
+      ansible.builtin.command:
+        cmd: "docker stats {{ container_name }} --no-stream --format 'CPU: {{ '{{' }}.CPUPerc{{ '}}' }} | Memory: {{ '{{' }}.MemUsage{{ '}}' }} | Network: {{ '{{' }}.NetIO{{ '}}' }}'"
+      register: resource_usage
+      changed_when: false
+      failed_when: false
+      when: container_exists.stdout != ""
+
+    - name: Display resource usage
+      ansible.builtin.debug:
+        msg: "{{ resource_usage.stdout }}"
+      when: 
+        - container_exists.stdout != ""
+        - resource_usage.stdout is defined
+
+    # =========================================================================
+    # LOGS
+    # =========================================================================
+    
+    - name: Collect container logs
+      ansible.builtin.command:
+        cmd: "docker logs --tail {{ log_lines }} {{ container_name }}"
+      register: container_logs
+      changed_when: false
+      failed_when: false
+      when: 
+        - container_exists.stdout != ""
+        - collect_logs | bool
+
+    - name: Display recent logs
+      ansible.builtin.debug:
+        msg: "{{ container_logs.stdout_lines[-20:] }}"
+      when: 
+        - container_exists.stdout != ""
+        - collect_logs | bool
+        - container_logs.stdout_lines is defined
+
+    # =========================================================================
+    # NETWORK PORTS
+    # =========================================================================
+    
+    - name: Get container ports
+      ansible.builtin.command:
+        cmd: "docker port {{ container_name }}"
+      register: container_ports
+      changed_when: false
+      failed_when: false
+      when: container_exists.stdout != ""
+
+    - name: Display exposed ports
+      ansible.builtin.debug:
+        msg: "{{ container_ports.stdout_lines | default(['No ports exposed']) }}"
+      when: container_exists.stdout != ""
+
+    # =========================================================================
+    # SERVICE-SPECIFIC CHECKS
+    # =========================================================================
+    
+    - name: Check Neutron API health
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9696/"
+        method: GET
+        timeout: 10
+      register: neutron_api
+      failed_when: false
+      when: container_name == 'neutron_server'
+
+    - name: Display Neutron API status
+      ansible.builtin.debug:
+        msg: "Neutron API: {{ 'HEALTHY' if neutron_api.status == 200 else 'UNHEALTHY (' + (neutron_api.status | string) + ')' }}"
+      when: 
+        - container_name == 'neutron_server'
+        - neutron_api is defined
+
+    - name: Check Nova API health
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8774/"
+        method: GET
+        timeout: 10
+      register: nova_api
+      failed_when: false
+      when: container_name == 'nova_api'
+
+    - name: Display Nova API status
+      ansible.builtin.debug:
+        msg: "Nova API: {{ 'HEALTHY' if nova_api.status == 200 else 'UNHEALTHY (' + (nova_api.status | string) + ')' }}"
+      when: 
+        - container_name == 'nova_api'
+        - nova_api is defined
+
+    - name: Check Keystone health
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:5000/v3/"
+        method: GET
+        timeout: 10
+      register: keystone_api
+      failed_when: false
+      when: container_name == 'keystone'
+
+    - name: Display Keystone status
+      ansible.builtin.debug:
+        msg: "Keystone API: {{ 'HEALTHY' if keystone_api.status == 200 else 'UNHEALTHY (' + (keystone_api.status | string) + ')' }}"
+      when: 
+        - container_name == 'keystone'
+        - keystone_api is defined
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    
+    - name: Set health status fact
+      ansible.builtin.set_fact:
+        container_healthy: "{{ container_exists.stdout != '' and container_details.stdout is search('Status: running') }}"
+
+    - name: Display health summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          CONTAINER HEALTH SUMMARY
+          ============================================
+          Container: {{ container_name }}
+          Exists: {{ 'YES' if container_exists.stdout != '' else 'NO' }}
+          Healthy: {{ 'YES' if container_healthy else 'NO' }}
+          ============================================

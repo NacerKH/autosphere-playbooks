@@ -1,0 +1,115 @@
+---
+# Docker Container Restart Playbook
+# Restarts a Kolla OpenStack container
+# AWX Template ID: 21 (suggested)
+
+- name: Restart Docker Container
+  hosts: "{{ target_host | default('openstack') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    container_name: "{{ container | default('neutron_server') }}"
+    wait_timeout: "{{ timeout | default(60) }}"
+    graceful_stop: "{{ graceful | default(true) }}"
+    stop_timeout: "{{ stop_wait | default(30) }}"
+
+  tasks:
+    # =========================================================================
+    # PRE-CHECKS
+    # =========================================================================
+    
+    - name: Check if container exists
+      ansible.builtin.command:
+        cmd: "docker ps -a --filter name=^{{ container_name }}$ --format '{{ '{{' }}.Names{{ '}}' }}'"
+      register: container_exists
+      changed_when: false
+
+    - name: Fail if container does not exist
+      ansible.builtin.fail:
+        msg: "Container '{{ container_name }}' does not exist on this host"
+      when: container_exists.stdout == ""
+
+    - name: Get current container state
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}'"
+      register: state_before
+      changed_when: false
+
+    - name: Capture logs before restart
+      ansible.builtin.command:
+        cmd: "docker logs --tail 100 {{ container_name }}"
+      register: logs_before
+      changed_when: false
+      failed_when: false
+
+    # =========================================================================
+    # RESTART CONTAINER
+    # =========================================================================
+    
+    - name: Restart container (graceful)
+      ansible.builtin.command:
+        cmd: "docker restart -t {{ stop_timeout }} {{ container_name }}"
+      register: restart_result
+      when: graceful_stop | bool
+
+    - name: Restart container (force)
+      ansible.builtin.command:
+        cmd: "docker restart {{ container_name }}"
+      register: restart_result
+      when: not (graceful_stop | bool)
+
+    # =========================================================================
+    # WAIT AND VALIDATE
+    # =========================================================================
+    
+    - name: Wait for container to be running
+      ansible.builtin.command:
+        cmd: "docker ps --filter name=^{{ container_name }}$ --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'"
+      register: running_check
+      until: running_check.stdout == container_name
+      retries: "{{ (wait_timeout | int / 5) | int }}"
+      delay: 5
+
+    - name: Get final container state
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}'"
+      register: state_after
+      changed_when: false
+
+    - name: Get health status
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}if .State.Health{{ '}}' }}{{ '{{' }}.State.Health.Status{{ '}}' }}{{ '{{' }}else{{ '}}' }}no-healthcheck{{ '{{' }}end{{ '}}' }}'"
+      register: health_status
+      changed_when: false
+      failed_when: false
+
+    - name: Capture logs after restart
+      ansible.builtin.command:
+        cmd: "docker logs --tail 30 {{ container_name }}"
+      register: logs_after
+      changed_when: false
+      failed_when: false
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    
+    - name: Display restart summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          CONTAINER RESTART SUMMARY
+          ============================================
+          Container: {{ container_name }}
+          State Before: {{ state_before.stdout }}
+          State After: {{ state_after.stdout }}
+          Health Status: {{ health_status.stdout | default('unknown') }}
+          Graceful Stop: {{ graceful_stop }}
+          Stop Timeout: {{ stop_timeout }}s
+          ============================================
+
+    - name: Fail if container not running
+      ansible.builtin.fail:
+        msg: "Container '{{ container_name }}' failed to restart. State: {{ state_after.stdout }}"
+      when: state_after.stdout != 'running'

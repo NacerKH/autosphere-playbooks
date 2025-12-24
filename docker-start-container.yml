@@ -1,0 +1,214 @@
+---
+# Docker Container Start Playbook
+# Starts a stopped Kolla OpenStack container
+# AWX Template ID: 20 (suggested)
+
+- name: Start Docker Container
+  hosts: "{{ target_host | default('openstack') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    container_name: "{{ container | default('neutron_server') }}"
+    wait_timeout: "{{ timeout | default(30) }}"
+    validate_health: "{{ validate | default(true) }}"
+
+  tasks:
+    # =========================================================================
+    # PRE-CHECKS
+    # =========================================================================
+    
+    - name: Check if container exists
+      ansible.builtin.command:
+        cmd: "docker ps -a --filter name=^{{ container_name }}$ --format '{{ '{{' }}.Names{{ '}}' }}'"
+      register: container_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if container does not exist
+      ansible.builtin.fail:
+        msg: "Container '{{ container_name }}' does not exist on this host"
+      when: container_exists.stdout == ""
+
+    - name: Check current container state
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}'"
+      register: container_state
+      changed_when: false
+
+    - name: Display current state
+      ansible.builtin.debug:
+        msg: "Container '{{ container_name }}' current state: {{ container_state.stdout }}"
+
+    # =========================================================================
+    # CRASH LOOP DETECTION
+    # =========================================================================
+    
+    - name: Get container restart count
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.RestartCount{{ '}}' }}'"
+      register: restart_count
+      changed_when: false
+
+    - name: Get container start time
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.StartedAt{{ '}}' }}'"
+      register: started_at
+      changed_when: false
+
+    - name: Check for crash loop (more than 3 restarts)
+      ansible.builtin.fail:
+        msg: |
+          CRASH LOOP DETECTED!
+          Container '{{ container_name }}' has restarted {{ restart_count.stdout }} times.
+          Last started at: {{ started_at.stdout }}
+          Manual investigation required - escalating to human operator.
+      when: 
+        - restart_count.stdout | int > 3
+        - not (force_start | default(false) | bool)
+
+    # =========================================================================
+    # GET LAST LOGS (for diagnostics)
+    # =========================================================================
+    
+    - name: Capture last 50 lines of logs before start
+      ansible.builtin.command:
+        cmd: "docker logs --tail 50 {{ container_name }}"
+      register: container_logs_before
+      changed_when: false
+      failed_when: false
+
+    - name: Get exit code if stopped
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.ExitCode{{ '}}' }}'"
+      register: exit_code
+      changed_when: false
+      when: container_state.stdout != 'running'
+
+    - name: Display exit code
+      ansible.builtin.debug:
+        msg: "Container exit code: {{ exit_code.stdout | default('N/A') }}"
+      when: container_state.stdout != 'running'
+
+    # =========================================================================
+    # START CONTAINER
+    # =========================================================================
+    
+    - name: Start container
+      ansible.builtin.command:
+        cmd: "docker start {{ container_name }}"
+      register: start_result
+      when: container_state.stdout != 'running'
+
+    - name: Container already running
+      ansible.builtin.debug:
+        msg: "Container '{{ container_name }}' is already running - no action needed"
+      when: container_state.stdout == 'running'
+
+    # =========================================================================
+    # WAIT FOR STARTUP
+    # =========================================================================
+    
+    - name: Wait for container to be running
+      ansible.builtin.command:
+        cmd: "docker ps --filter name=^{{ container_name }}$ --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'"
+      register: running_check
+      until: running_check.stdout == container_name
+      retries: "{{ (wait_timeout | int / 5) | int }}"
+      delay: 5
+      when: container_state.stdout != 'running'
+
+    # =========================================================================
+    # VALIDATION
+    # =========================================================================
+    
+    - name: Verify container is running
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}'"
+      register: final_state
+      changed_when: false
+
+    - name: Get container health status (if available)
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}if .State.Health{{ '}}' }}{{ '{{' }}.State.Health.Status{{ '}}' }}{{ '{{' }}else{{ '}}' }}no-healthcheck{{ '{{' }}end{{ '}}' }}'"
+      register: health_status
+      changed_when: false
+      failed_when: false
+
+    - name: Capture logs after start
+      ansible.builtin.command:
+        cmd: "docker logs --tail 20 {{ container_name }}"
+      register: container_logs_after
+      changed_when: false
+      failed_when: false
+      when: validate_health | bool
+
+    - name: Display recovery summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          CONTAINER RECOVERY SUMMARY
+          ============================================
+          Container: {{ container_name }}
+          Previous State: {{ container_state.stdout }}
+          Current State: {{ final_state.stdout }}
+          Health Status: {{ health_status.stdout | default('unknown') }}
+          Exit Code (before): {{ exit_code.stdout | default('N/A') }}
+          Restart Count: {{ restart_count.stdout }}
+          ============================================
+
+    - name: Fail if container not running
+      ansible.builtin.fail:
+        msg: "Container '{{ container_name }}' failed to start. Current state: {{ final_state.stdout }}"
+      when: final_state.stdout != 'running'
+
+    # =========================================================================
+    # SERVICE-SPECIFIC VALIDATION
+    # =========================================================================
+    
+    - name: Validate Neutron Server API (if neutron_server)
+      block:
+        - name: Wait for Neutron API port
+          ansible.builtin.wait_for:
+            port: 9696
+            host: 127.0.0.1
+            timeout: 30
+          when: container_name == 'neutron_server'
+      rescue:
+        - name: Neutron API not responding
+          ansible.builtin.debug:
+            msg: "Warning: Neutron API port 9696 not responding yet, but container is running"
+      when: container_name == 'neutron_server'
+
+    - name: Validate Nova API (if nova_api)
+      block:
+        - name: Wait for Nova API port
+          ansible.builtin.wait_for:
+            port: 8774
+            host: 127.0.0.1
+            timeout: 30
+          when: container_name == 'nova_api'
+      rescue:
+        - name: Nova API not responding
+          ansible.builtin.debug:
+            msg: "Warning: Nova API port 8774 not responding yet, but container is running"
+      when: container_name == 'nova_api'
+
+    - name: Validate Keystone API (if keystone)
+      block:
+        - name: Wait for Keystone API port
+          ansible.builtin.wait_for:
+            port: 5000
+            host: 127.0.0.1
+            timeout: 30
+          when: container_name == 'keystone'
+      rescue:
+        - name: Keystone API not responding
+          ansible.builtin.debug:
+            msg: "Warning: Keystone API port 5000 not responding yet, but container is running"
+      when: container_name == 'keystone'
+
+  handlers:
+    - name: Log recovery to syslog
+      ansible.builtin.command:
+        cmd: "logger -t autosphere 'Container {{ container_name }} recovered by AutoSphere'"

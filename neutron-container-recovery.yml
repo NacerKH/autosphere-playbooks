@@ -1,0 +1,299 @@
+---
+# Neutron Server Container Recovery Playbook
+# Full autonomous recovery flow for AutoSphere demo
+# AWX Template ID: 23 (suggested)
+#
+# This playbook implements the full recovery flow:
+# 1. DETECT: Check container is not running
+# 2. TRIAGE: Fetch logs, check exit reason, detect crash loops
+# 3. EXECUTE: docker start neutron_server
+# 4. VALIDATE: Confirm container running and API responding
+#
+# Usage:
+#   ansible-playbook neutron-container-recovery.yml -e "target_host=openstack"
+
+- name: Neutron Server Container Recovery
+  hosts: "{{ target_host | default('openstack') }}"
+  gather_facts: true
+  become: true
+
+  vars:
+    container_name: "neutron_server"
+    api_port: 9696
+    wait_timeout: 60
+    max_restart_count: 3
+    crash_loop_window_minutes: 5
+    env: "{{ environment | default('demo') }}"
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: DETECT
+    # =========================================================================
+    
+    - name: "DETECT | Record detection timestamp"
+      ansible.builtin.set_fact:
+        detection_timestamp: "{{ ansible_date_time.iso8601 }}"
+        detection_hostname: "{{ ansible_hostname }}"
+
+    - name: "DETECT | Check if container exists"
+      ansible.builtin.command:
+        cmd: "docker ps -a --filter name=^{{ container_name }}$ --format '{{ '{{' }}.Names{{ '}}' }}'"
+      register: container_exists
+      changed_when: false
+
+    - name: "DETECT | Fail if container does not exist"
+      ansible.builtin.fail:
+        msg: |
+          DETECTION FAILED: Container '{{ container_name }}' does not exist.
+          Host: {{ detection_hostname }}
+          Timestamp: {{ detection_timestamp }}
+          Action: Manual investigation required
+      when: container_exists.stdout == ""
+
+    - name: "DETECT | Get container state"
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}'"
+      register: container_state
+      changed_when: false
+
+    - name: "DETECT | Container is running - no action needed"
+      ansible.builtin.debug:
+        msg: |
+          Container '{{ container_name }}' is already running.
+          No recovery action needed.
+      when: container_state.stdout == 'running'
+
+    - name: "DETECT | End play if container is running"
+      ansible.builtin.meta: end_play
+      when: container_state.stdout == 'running'
+
+    - name: "DETECT | Log detection"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          PHASE 1: DETECTION COMPLETE
+          ============================================
+          Container: {{ container_name }}
+          State: {{ container_state.stdout }}
+          Host: {{ detection_hostname }}
+          Timestamp: {{ detection_timestamp }}
+          ============================================
+
+    # =========================================================================
+    # PHASE 2: TRIAGE
+    # =========================================================================
+    
+    - name: "TRIAGE | Fetch last 200 lines of logs"
+      ansible.builtin.command:
+        cmd: "docker logs --tail 200 {{ container_name }}"
+      register: container_logs
+      changed_when: false
+      failed_when: false
+
+    - name: "TRIAGE | Get container exit code"
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.ExitCode{{ '}}' }}'"
+      register: exit_code
+      changed_when: false
+
+    - name: "TRIAGE | Get container exit reason"
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.Error{{ '}}' }}'"
+      register: exit_error
+      changed_when: false
+      failed_when: false
+
+    - name: "TRIAGE | Get restart count"
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.RestartCount{{ '}}' }}'"
+      register: restart_count
+      changed_when: false
+
+    - name: "TRIAGE | Get last start time"
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.StartedAt{{ '}}' }}'"
+      register: last_start_time
+      changed_when: false
+
+    - name: "TRIAGE | Get last finish time"
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.FinishedAt{{ '}}' }}'"
+      register: last_finish_time
+      changed_when: false
+
+    - name: "TRIAGE | Check for configuration errors in logs"
+      ansible.builtin.set_fact:
+        config_error_detected: "{{ container_logs.stdout is search('ConfigParser|config|permission denied|FATAL|cannot parse', ignorecase=True) }}"
+
+    - name: "TRIAGE | Log triage summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          PHASE 2: TRIAGE COMPLETE
+          ============================================
+          Exit Code: {{ exit_code.stdout }}
+          Exit Error: {{ exit_error.stdout | default('None') }}
+          Restart Count: {{ restart_count.stdout }}
+          Last Started: {{ last_start_time.stdout }}
+          Last Finished: {{ last_finish_time.stdout }}
+          Config Error: {{ config_error_detected }}
+          ============================================
+
+    # =========================================================================
+    # CRASH LOOP / CONFIG ERROR DETECTION
+    # =========================================================================
+    
+    - name: "TRIAGE | BLOCK: Crash loop detected"
+      ansible.builtin.fail:
+        msg: |
+          ============================================
+          CRASH LOOP DETECTED - HUMAN APPROVAL REQUIRED
+          ============================================
+          Container: {{ container_name }}
+          Restart Count: {{ restart_count.stdout }} (threshold: {{ max_restart_count }})
+          
+          Action: Auto-recovery blocked. Manual investigation required.
+          
+          Suggested steps:
+          1. Check container logs: docker logs {{ container_name }}
+          2. Check for resource constraints: docker stats {{ container_name }}
+          3. Verify configuration files
+          4. Contact on-call engineer
+          ============================================
+      when: restart_count.stdout | int > max_restart_count
+
+    - name: "TRIAGE | BLOCK: Configuration error detected"
+      ansible.builtin.fail:
+        msg: |
+          ============================================
+          CONFIG ERROR DETECTED - HUMAN APPROVAL REQUIRED
+          ============================================
+          Container: {{ container_name }}
+          Exit Code: {{ exit_code.stdout }}
+          
+          Log excerpt shows configuration-related errors.
+          Auto-recovery blocked.
+          
+          Suggested steps:
+          1. Review configuration: docker exec {{ container_name }} cat /etc/neutron/neutron.conf
+          2. Check recent config changes
+          3. Validate with: docker exec {{ container_name }} neutron-server --config-file /etc/neutron/neutron.conf --check
+          ============================================
+      when: 
+        - config_error_detected | bool
+        - exit_code.stdout | int != 0
+
+    # =========================================================================
+    # PHASE 3: EXECUTE RECOVERY
+    # =========================================================================
+    
+    - name: "EXECUTE | Start container"
+      ansible.builtin.command:
+        cmd: "docker start {{ container_name }}"
+      register: start_result
+
+    - name: "EXECUTE | Wait for container to start"
+      ansible.builtin.command:
+        cmd: "docker ps --filter name=^{{ container_name }}$ --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'"
+      register: running_check
+      until: running_check.stdout == container_name
+      retries: 12
+      delay: 5
+
+    - name: "EXECUTE | Log execution"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          PHASE 3: EXECUTION COMPLETE
+          ============================================
+          Command: docker start {{ container_name }}
+          Result: {{ start_result.rc == 0 | ternary('SUCCESS', 'FAILED') }}
+          ============================================
+
+    # =========================================================================
+    # PHASE 4: VALIDATE
+    # =========================================================================
+    
+    - name: "VALIDATE | Verify container is running"
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}'"
+      register: final_state
+      changed_when: false
+
+    - name: "VALIDATE | Wait for Neutron API port"
+      ansible.builtin.wait_for:
+        port: "{{ api_port }}"
+        host: 127.0.0.1
+        timeout: 30
+      register: port_check
+      failed_when: false
+
+    - name: "VALIDATE | Check Neutron API health"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ api_port }}/"
+        method: GET
+        timeout: 10
+      register: api_check
+      failed_when: false
+
+    - name: "VALIDATE | Get final logs (clean startup)"
+      ansible.builtin.command:
+        cmd: "docker logs --tail 20 {{ container_name }}"
+      register: final_logs
+      changed_when: false
+      failed_when: false
+
+    - name: "VALIDATE | Set validation result"
+      ansible.builtin.set_fact:
+        validation_passed: "{{ final_state.stdout == 'running' and (api_check.status | default(0)) in [200, 300, 401, 404] }}"
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    
+    - name: "SUMMARY | Recovery complete"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          NEUTRON CONTAINER RECOVERY SUMMARY
+          ============================================
+          Incident ID: NEUTRON-{{ ansible_date_time.epoch }}
+          Timestamp: {{ detection_timestamp }}
+          Host: {{ detection_hostname }}
+          Environment: {{ env }}
+          
+          DETECTION:
+            Container: {{ container_name }}
+            Initial State: {{ container_state.stdout }}
+          
+          TRIAGE:
+            Exit Code: {{ exit_code.stdout }}
+            Restart Count: {{ restart_count.stdout }}
+            Config Error: {{ config_error_detected }}
+          
+          EXECUTION:
+            Command: docker start {{ container_name }}
+            Result: {{ start_result.rc == 0 | ternary('SUCCESS', 'FAILED') }}
+          
+          VALIDATION:
+            Container State: {{ final_state.stdout }}
+            API Port {{ api_port }}: {{ port_check.state | default('unknown') }}
+            API Health: {{ (api_check.status | default(0)) in [200, 300, 401, 404] | ternary('HEALTHY', 'UNHEALTHY') }}
+            
+          FINAL STATUS: {{ validation_passed | ternary('RECOVERED', 'FAILED') }}
+          ============================================
+
+    - name: "SUMMARY | Fail if validation failed"
+      ansible.builtin.fail:
+        msg: |
+          Recovery validation failed!
+          Container state: {{ final_state.stdout }}
+          API status: {{ api_check.status | default('unreachable') }}
+          
+          Manual intervention required.
+      when: not validation_passed
+
+    - name: "SUMMARY | Log to syslog"
+      ansible.builtin.command:
+        cmd: "logger -t autosphere 'Neutron container recovered successfully. Incident: NEUTRON-{{ ansible_date_time.epoch }}'"
+      changed_when: false
