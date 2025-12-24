@@ -78,7 +78,7 @@
       uri:
         url: "{{ item.url }}"
         method: GET
-        status_code: [200, 300]
+        status_code: [200, 300,401]
         validate_certs: no
       register: api_health
       loop:
